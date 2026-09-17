@@ -37,17 +37,63 @@ SHOP_DOMAINS = {
 }
 
 
+# ID сайта в поле sajt -> магазин (надёжнее домена: есть даже без ссылки).
+SAJT_TO_SHOP = {"22": "Black-street", "21": "Bonna-shop", "19": "Blink"}
+
+# токены каталогов (категория по артикулу). Имена секретов — как у тебя.
+PROM_TOKENS = {
+    "Black-street": os.environ.get("TOKEN_BLACKSTREET", "").strip(),
+    "Bonna-shop":   os.environ.get("TOKEN_BONNA", "").strip(),
+}
+HOROSHOP = {
+    "domain":   os.environ.get("HOROSHOP_DOMAIN", "").strip(),
+    "login":    os.environ.get("HOROSHOP_LOGIN", "").strip(),
+    "password": os.environ.get("HOROSHOP_PASSWORD", "").strip(),
+}
+
+
 def _dom(h):
     m = re.search(r"https?://([^/]+)", h or "")
     return m.group(1).lower().replace("www.", "") if m else ""
 
 
 def shop_of(order):
-    for p in order.get("products") or []:
+    s = str(order.get("sajt"))
+    if s in SAJT_TO_SHOP:
+        return SAJT_TO_SHOP[s]
+    for p in order.get("products") or []:      # запасной вариант — по домену ссылки
         d = _dom(p.get("href"))
-        if d:
-            return SHOP_DOMAINS.get(d, "?:" + d)  # неизвестный домен покажем как ?:домен
+        if d in SHOP_DOMAINS:
+            return SHOP_DOMAINS[d]
     return "?"
+
+
+def prom_catalog(token, cap=30000):
+    """Артикул -> категория (group.name) из Prom API."""
+    idx, url = {}, "https://my.prom.ua/api/v1/products/list"
+    headers = {"Authorization": "Bearer " + token}
+    last, got = None, 0
+    while got < cap:
+        params = {"limit": 100}
+        if last:
+            params["last_id"] = last
+        r = requests.get(url, headers=headers, params=params, timeout=40)
+        if r.status_code != 200:
+            print(f"  Prom HTTP {r.status_code}: {r.text[:200]}")
+            break
+        prods = (r.json() or {}).get("products", [])
+        if not prods:
+            break
+        for p in prods:
+            sku = (p.get("sku") or "").strip()
+            if sku:
+                idx[sku] = (p.get("group") or {}).get("name")
+        got += len(prods)
+        last = prods[-1].get("id")
+        if len(prods) < 100:
+            break
+        time.sleep(0.3)
+    return idx
 
 
 # Источник в MyDrop по логике: сайт (домен) + Витрати (expensesAmount).
@@ -221,11 +267,48 @@ def probe(resp):
         mark = "  <- НУЖЕН" if s in WANTED_SOURCES else ""
         print(f"  {s}: {n}{mark}")
 
-    # какие значения принимает поле sajt (чтобы решить: брать сайт из него или из домена)
+    # какие значения принимает поле sajt
     sj = Counter(str(x.get("sajt")) for x in orders)
     print("\n=== ЗНАЧЕНИЯ ПОЛЯ 'sajt' ===")
     for s, n in sj.most_common(10):
         print(f"  {s!r}: {n}")
+
+    # --- КАТЕГОРИЯ ПО АРТИКУЛУ через Prom (Black-street/Bonna) ---
+    prom_idx = {}
+    for shop, tok in PROM_TOKENS.items():
+        if not tok:
+            print(f"\n[Prom] нет токена для {shop} (секрет пустой) — пропускаю")
+            continue
+        print(f"\n[Prom] тяну каталог {shop}…")
+        idx = prom_catalog(tok)
+        print(f"[Prom] {shop}: товаров с артикулом = {len(idx)}")
+        prom_idx[shop] = idx
+
+    if prom_idx:
+        print("\n=== КАТЕГОРИЯ ПО АРТИКУЛУ (site-заказы) ===")
+        shown = matched = total = 0
+        miss = []
+        for x in orders:
+            e = extract(x)
+            if e["source"] not in ("Сайт-Black-street", "Сайт-Bonna-shop"):
+                continue
+            idx = prom_idx.get(e["shop"], {})
+            for sku in e["skus"]:
+                if not sku:
+                    continue
+                total += 1
+                # пробуем точный артикул и без суффикса " (B)"
+                cat = idx.get(sku) or idx.get(sku.replace(" (B)", "").strip())
+                if cat:
+                    matched += 1
+                elif len(miss) < 10:
+                    miss.append(f"{e['shop']}:{sku!r}")
+                if shown < 15:
+                    print(f"  {e['shop']}: {sku!r} -> {cat}")
+                    shown += 1
+        print(f"\nСовпало артикулов: {matched}/{total}")
+        if miss:
+            print("Не нашлись (примеры):", ", ".join(miss))
 
 
 def main():
