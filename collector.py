@@ -96,6 +96,12 @@ def prom_catalog(token, cap=30000):
     return idx
 
 
+def norm_sku(s):
+    """Артикул без вариации/размера: всё от первой '(' режем, пробелы убираем, lower."""
+    s = re.sub(r"\s*\(.*$", "", (s or "").strip())   # "Ads-419 (B)" -> "Ads-419"
+    return re.sub(r"\s+", "", s).lower()
+
+
 # Источник в MyDrop по логике: сайт (домен) + Витрати (expensesAmount).
 # Витрати пусто -> "Сайт-<магазин>" (Google-трафик, НУЖЕН);
 # Витрати есть  -> "Prom-<магазин>" (Пром, НЕ нужен);
@@ -285,30 +291,46 @@ def probe(resp):
         prom_idx[shop] = idx
 
     if prom_idx:
-        print("\n=== КАТЕГОРИЯ ПО АРТИКУЛУ (site-заказы) ===")
-        shown = matched = total = 0
-        miss = []
+        # нормализованный индекс каждого каталога: база артикула -> категория
+        norm_idx = {}
+        for shop, idx in prom_idx.items():
+            ni = {}
+            for sku, cat in idx.items():
+                ni.setdefault(norm_sku(sku), cat)
+            norm_idx[shop] = ni
+            print(f"[Prom] {shop}: артикулов={len(idx)}, уникальных баз={len(ni)}")
+        master = norm_idx.get("Black-street", {})   # ЭТАЛОН — каталог Black-street
+        print(f"[ЭТАЛОН] Black-street: {len(master)} баз артикулов")
+
+        print("\n=== КАТЕГОРИЯ ПО АРТИКУЛУ (по эталону Black-street) ===")
+        total = matched = notfound = shown = 0
+        ex_nf = []
         for x in orders:
             e = extract(x)
-            if e["source"] not in ("Сайт-Black-street", "Сайт-Bonna-shop"):
+            if e["source"] not in ("Сайт-Black-street", "Сайт-Bonna-shop", "Хор-Blink"):
                 continue
-            idx = prom_idx.get(e["shop"], {})
             for sku in e["skus"]:
                 if not sku:
                     continue
                 total += 1
-                # пробуем точный артикул и без суффикса " (B)"
-                cat = idx.get(sku) or idx.get(sku.replace(" (B)", "").strip())
+                n = norm_sku(sku)
+                cat = master.get(n)                       # сперва эталон
+                if not cat:                               # потом свой каталог (если есть)
+                    cat = norm_idx.get(e["shop"], {}).get(n)
                 if cat:
                     matched += 1
-                elif len(miss) < 10:
-                    miss.append(f"{e['shop']}:{sku!r}")
-                if shown < 15:
-                    print(f"  {e['shop']}: {sku!r} -> {cat}")
+                    tag = cat
+                else:
+                    notfound += 1
+                    tag = "(нет категории)"
+                    if len(ex_nf) < 15:
+                        ex_nf.append(f"{e['shop']}:{sku!r}")
+                if shown < 18:
+                    print(f"  {e['shop']}: {sku!r} -> {tag}")
                     shown += 1
-        print(f"\nСовпало артикулов: {matched}/{total}")
-        if miss:
-            print("Не нашлись (примеры):", ", ".join(miss))
+        print(f"\nВсего артикулов: {total} | с категорией: {matched} | без категории: {notfound}")
+        if ex_nf:
+            print("Без категории (примеры):", ", ".join(ex_nf))
 
 
 def main():
