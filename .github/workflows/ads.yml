@@ -26,7 +26,7 @@ jobs:
       - run: pip install requests
       - name: Run collector
         env:
-          SALESDRIVE_URL: ${{ vars.SALESDRIVE_URL }}
+          SALESDRIVE_URL: ${{ secrets.SALESDRIVE_URL }}
           SALESDRIVE_API_KEY: ${{ secrets.SALESDRIVE_API_KEY }}
           SD_DAYS: ${{ github.event.inputs.days || '14' }}
           SD_PROBE: ${{ github.event.inputs.probe || '1' }}
