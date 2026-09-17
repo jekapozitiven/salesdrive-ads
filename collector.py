@@ -15,7 +15,7 @@ BBB CLUB — сборщик рекламной статистики по кам�
 
 Лимиты SalesDrive: 10 запросов/мин, 100/час, 1000/сутки — поэтому пауза между страницами.
 """
-import os, sys, json, time, datetime as dt
+import os, sys, json, time, re, datetime as dt
 from collections import Counter
 import requests
 
@@ -27,6 +27,45 @@ MAX_PAGES = int(os.environ.get("SD_MAX_PAGES", "50"))
 SLEEP     = float(os.environ.get("SD_SLEEP", "7"))   # держим < 10 запросов/мин
 TIMEOUT   = int(os.environ.get("SD_TIMEOUT", "40"))
 PROBE     = os.environ.get("SD_PROBE", "").strip() in ("1", "true", "yes")
+
+
+# домен сайта -> магазин. Blink подтверждён из примера; остальные добавим по выводу.
+SHOP_DOMAINS = {
+    "blink.in.ua": "Blink",
+    # "<домен black-street>": "Black-street",
+    # "<домен bonna>":        "Bonna-shop",
+}
+
+
+def _dom(h):
+    m = re.search(r"https?://([^/]+)", h or "")
+    return m.group(1).lower().replace("www.", "") if m else ""
+
+
+def shop_of(order):
+    for p in order.get("products") or []:
+        d = _dom(p.get("href"))
+        if d:
+            return SHOP_DOMAINS.get(d, "?:" + d)  # неизвестный домен покажем как ?:домен
+    return "?"
+
+
+def extract(o):
+    prods = o.get("products") or []
+    main = [p for p in prods if not p.get("upsell")]
+    ups = [p for p in prods if p.get("upsell")]
+    amt = lambda p: (p.get("price") or 0) * (p.get("amount") or 1)
+    return {
+        "id": o.get("id"),
+        "externalId": o.get("externalId"),
+        "date": (o.get("orderTime") or "")[:10],
+        "statusId": o.get("statusId"),
+        "shop": shop_of(o),
+        "skus": [p.get("sku") for p in main],
+        "mainSum": sum(amt(p) for p in main),
+        "upsells": [{"name": p.get("text"), "price": p.get("price")} for p in ups],
+        "upsellSum": sum(amt(p) for p in ups),
+    }
 
 
 def _base():
@@ -130,6 +169,40 @@ def probe(resp):
     print("\n=== ЧАСТОТА ПОЛЕЙ (топ-40) ===")
     for k, n in c.most_common(40):
         print(f"  {k}: {n}")
+
+    # --- значения ключевых полей по первым заказам (для выбора схемы привязки) ---
+    def dom(h):
+        m = re.search(r"https?://([^/]+)", h or "")
+        return m.group(1) if m else ""
+    print("\n=== КЛЮЧЕВЫЕ ПОЛЯ (первые 10 заказов, без апселов) ===")
+    for x in orders[:10]:
+        prods = [p for p in (x.get("products") or []) if not p.get("upsell")]
+        skus = [p.get("sku", "") for p in prods]
+        doms = sorted({dom(p.get("href")) for p in prods if p.get("href")})
+        print(f"id={x.get('id')} externalId={x.get('externalId')!r} sajt={x.get('sajt')!r} "
+              f"formId={x.get('formId')} statusId={x.get('statusId')} "
+              f"utmSource={x.get('utmSource')!r} utmMedium={x.get('utmMedium')!r} "
+              f"utmCampaign={x.get('utmCampaign')!r} campaignId={x.get('campaignId')!r} "
+              f"shops={doms} sku={skus}")
+    n_ext = sum(1 for x in orders if x.get("externalId"))
+    print(f"\nИз {len(orders)} заказов: с externalId={n_ext} (ключ для джойна с MyDrop)")
+
+    # --- разобранный вид: основное + допродажа отдельно, магазин по домену ---
+    print("\n=== РАЗБОР ЗАКАЗА (первые 12) ===")
+    for x in orders[:12]:
+        e = extract(x)
+        print(f"ext={e['externalId']!r} магазин={e['shop']} дата={e['date']} статус={e['statusId']} "
+              f"sku={e['skus']} сумма_осн={e['mainSum']} допродажа={e['upsells']} сумма_доп={e['upsellSum']}")
+    # какие домены встретились (чтобы дополнить карту магазинов)
+    dc = Counter()
+    for x in orders:
+        for p in x.get("products") or []:
+            d = _dom(p.get("href"))
+            if d:
+                dc[d] += 1
+    print("\n=== ДОМЕНЫ САЙТОВ (какой = какой магазин) ===")
+    for d, n in dc.most_common():
+        print(f"  {d}: {n}  -> {SHOP_DOMAINS.get(d,'НЕ ЗНАЮ, скажи какой магазин')}")
 
 
 def main():
