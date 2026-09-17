@@ -32,8 +32,8 @@ PROBE     = os.environ.get("SD_PROBE", "").strip() in ("1", "true", "yes")
 # домен сайта -> магазин. Blink подтверждён из примера; остальные добавим по выводу.
 SHOP_DOMAINS = {
     "blink.in.ua": "Blink",
-    # "<домен black-street>": "Black-street",
-    # "<домен bonna>":        "Bonna-shop",
+    "black-street.com.ua": "Black-street",
+    "bonna-shop.com.ua": "Bonna-shop",
 }
 
 
@@ -50,6 +50,23 @@ def shop_of(order):
     return "?"
 
 
+# Источник в MyDrop по логике: сайт (домен) + Витрати (expensesAmount).
+# Витрати пусто -> "Сайт-<магазин>" (Google-трафик, НУЖЕН);
+# Витрати есть  -> "Prom-<магазин>" (Пром, НЕ нужен);
+# Blink -> всегда "Хор-Blink".
+WANTED_SOURCES = {"Сайт-Black-street", "Сайт-Bonna-shop", "Хор-Blink"}
+
+
+def site_source(o):
+    shop = shop_of(o)                      # Black-street / Bonna-shop / Blink / "?..."
+    vyt = o.get("expensesAmount") or 0
+    if shop == "Blink":
+        return "Хор-Blink"
+    if shop in ("Black-street", "Bonna-shop"):
+        return ("Prom-" if vyt else "Сайт-") + shop
+    return None                            # неизвестный сайт
+
+
 def extract(o):
     prods = o.get("products") or []
     main = [p for p in prods if not p.get("upsell")]
@@ -61,6 +78,9 @@ def extract(o):
         "date": (o.get("orderTime") or "")[:10],
         "statusId": o.get("statusId"),
         "shop": shop_of(o),
+        "sajt": o.get("sajt"),
+        "expenses": o.get("expensesAmount"),
+        "source": site_source(o),
         "skus": [p.get("sku") for p in main],
         "mainSum": sum(amt(p) for p in main),
         "upsells": [{"name": p.get("text"), "price": p.get("price")} for p in ups],
@@ -187,22 +207,25 @@ def probe(resp):
     n_ext = sum(1 for x in orders if x.get("externalId"))
     print(f"\nИз {len(orders)} заказов: с externalId={n_ext} (ключ для джойна с MyDrop)")
 
-    # --- разобранный вид: основное + допродажа отдельно, магазин по домену ---
-    print("\n=== РАЗБОР ЗАКАЗА (первые 12) ===")
-    for x in orders[:12]:
+    # --- разбор: сайт + Витрати -> источник, основное + допродажа ---
+    print("\n=== РАЗБОР ЗАКАЗА (первые 15) ===")
+    for x in orders[:15]:
         e = extract(x)
-        print(f"ext={e['externalId']!r} магазин={e['shop']} дата={e['date']} статус={e['statusId']} "
-              f"sku={e['skus']} сумма_осн={e['mainSum']} допродажа={e['upsells']} сумма_доп={e['upsellSum']}")
-    # какие домены встретились (чтобы дополнить карту магазинов)
-    dc = Counter()
-    for x in orders:
-        for p in x.get("products") or []:
-            d = _dom(p.get("href"))
-            if d:
-                dc[d] += 1
-    print("\n=== ДОМЕНЫ САЙТОВ (какой = какой магазин) ===")
-    for d, n in dc.most_common():
-        print(f"  {d}: {n}  -> {SHOP_DOMAINS.get(d,'НЕ ЗНАЮ, скажи какой магазин')}")
+        print(f"ext={e['externalId']!r} sajt={e['sajt']!r} Витрати={e['expenses']!r} -> ИСТОЧНИК={e['source']} "
+              f"| магазин={e['shop']} sku={e['skus']} осн={e['mainSum']} доп={e['upsellSum']}")
+
+    # сколько заказов в каждый источник (нам нужны только 3 сайтовых)
+    sc = Counter(extract(x)["source"] for x in orders)
+    print("\n=== ИСТОЧНИКИ (по логике сайт+Витрати) ===")
+    for s, n in sc.most_common():
+        mark = "  <- НУЖЕН" if s in WANTED_SOURCES else ""
+        print(f"  {s}: {n}{mark}")
+
+    # какие значения принимает поле sajt (чтобы решить: брать сайт из него или из домена)
+    sj = Counter(str(x.get("sajt")) for x in orders)
+    print("\n=== ЗНАЧЕНИЯ ПОЛЯ 'sajt' ===")
+    for s, n in sj.most_common(10):
+        print(f"  {s!r}: {n}")
 
 
 def main():
