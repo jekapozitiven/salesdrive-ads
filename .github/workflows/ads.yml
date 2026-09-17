@@ -30,9 +30,17 @@ jobs:
           SALESDRIVE_API_KEY: ${{ secrets.SALESDRIVE_API_KEY }}
           SD_DAYS: ${{ github.event.inputs.days || '14' }}
           SD_PROBE: ${{ github.event.inputs.probe || '1' }}
-          # понадобятся на этапе 2:
+          # каталоги категорий:
+          TOKEN_BLACKSTREET: ${{ secrets.TOKEN_BLACKSTREET }}
+          TOKEN_BONNA: ${{ secrets.TOKEN_BONNA }}
+          TOKEN_CORE22: ${{ secrets.TOKEN_CORE22 }}
+          TOKEN_STREETCODE: ${{ secrets.TOKEN_STREETCODE }}
+          HOROSHOP_DOMAIN: ${{ secrets.HOROSHOP_DOMAIN }}
+          HOROSHOP_LOGIN: ${{ secrets.HOROSHOP_LOGIN }}
+          HOROSHOP_PASSWORD: ${{ secrets.HOROSHOP_PASSWORD }}
+          # понадобятся дальше:
           MYDROP_API_KEY: ${{ secrets.MYDROP_API_KEY }}
-          FIREBASE_DB_URL: ${{ vars.FIREBASE_DB_URL }}
+          FIREBASE_DB_URL: ${{ secrets.FIREBASE_DB_URL }}
         run: python collector.py
 
       - name: Upload sample (если был обычный прогон)
