@@ -1,0 +1,44 @@
+name: Ads collector (SalesDrive)
+
+on:
+  workflow_dispatch:
+    inputs:
+      probe:
+        description: "Разведка полей (оставь 1 для первого запуска)"
+        required: false
+        default: "1"
+      days:
+        description: "За сколько последних дней тянуть"
+        required: false
+        default: "14"
+  # Расписание включим на ЭТАПЕ 2 (когда пойдёт запись в Firebase):
+  # schedule:
+  #   - cron: "5 * * * *"   # каждый час в :05
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - name: Run collector
+        env:
+          SALESDRIVE_URL: ${{ vars.SALESDRIVE_URL }}
+          SALESDRIVE_API_KEY: ${{ secrets.SALESDRIVE_API_KEY }}
+          SD_DAYS: ${{ github.event.inputs.days || '14' }}
+          SD_PROBE: ${{ github.event.inputs.probe || '1' }}
+          # понадобятся на этапе 2:
+          MYDROP_API_KEY: ${{ secrets.MYDROP_API_KEY }}
+          FIREBASE_DB_URL: ${{ vars.FIREBASE_DB_URL }}
+        run: python collector.py
+
+      - name: Upload sample (если был обычный прогон)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: orders_sample
+          path: orders_sample.json
+          if-no-files-found: ignore
