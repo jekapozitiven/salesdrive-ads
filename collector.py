@@ -44,6 +44,8 @@ SAJT_TO_SHOP = {"22": "Black-street", "21": "Bonna-shop", "19": "Blink"}
 PROM_TOKENS = {
     "Black-street": os.environ.get("TOKEN_BLACKSTREET", "").strip(),
     "Bonna-shop":   os.environ.get("TOKEN_BONNA", "").strip(),
+    "Core22":       os.environ.get("TOKEN_CORE22", "").strip(),
+    "Street Code":  os.environ.get("TOKEN_STREETCODE", "").strip(),
 }
 HOROSHOP = {
     "domain":   os.environ.get("HOROSHOP_DOMAIN", "").strip(),
@@ -89,7 +91,7 @@ def prom_catalog(token, cap=30000):
             if sku:
                 idx[sku] = (p.get("group") or {}).get("name")
         got += len(prods)
-        last = prods[-1].get("id")
+        last = min((p.get("id") or 0) for p in prods)   # надёжно для пагинации по last_id
         if len(prods) < 100:
             break
         time.sleep(0.3)
@@ -97,8 +99,11 @@ def prom_catalog(token, cap=30000):
 
 
 def norm_sku(s):
-    """Артикул без вариации/размера: всё от первой '(' режем, пробелы убираем, lower."""
-    s = re.sub(r"\s*\(.*$", "", (s or "").strip())   # "Ads-419 (B)" -> "Ads-419"
+    """База артикула без вариаций. База — заглавными, вариации — строчными/в скобках."""
+    s = (s or "").strip()
+    s = re.sub(r"\s*\(.*$", "", s)     # обрезать от первой "(" — (B), (коп1)L …
+    s = s.split("/")[0].strip()        # компаунд "Rap-RD266/RD015" -> "Rap-RD266"
+    s = re.sub(r"[a-z]\d*$", "", s)     # хвост-вариация строчными: q2, q, l (базы — ЗАГЛАВНЫМИ)
     return re.sub(r"\s+", "", s).lower()
 
 
@@ -299,24 +304,19 @@ def probe(resp):
                 ni.setdefault(norm_sku(sku), cat)
             norm_idx[shop] = ni
             print(f"[Prom] {shop}: артикулов={len(idx)}, уникальных баз={len(ni)}")
-        master = norm_idx.get("Black-street", {})   # ЭТАЛОН — каталог Black-street
-        print(f"[ЭТАЛОН] Black-street: {len(master)} баз артикулов")
-
-        print("\n=== КАТЕГОРИЯ ПО АРТИКУЛУ (по эталону Black-street) ===")
+        print("\n=== КАТЕГОРИЯ ПО АРТИКУЛУ (каждый магазин — свой каталог) ===")
         total = matched = notfound = shown = 0
         ex_nf = []
         for x in orders:
             e = extract(x)
             if e["source"] not in ("Сайт-Black-street", "Сайт-Bonna-shop", "Хор-Blink"):
                 continue
+            ni = norm_idx.get(e["shop"], {})
             for sku in e["skus"]:
                 if not sku:
                     continue
                 total += 1
-                n = norm_sku(sku)
-                cat = master.get(n)                       # сперва эталон
-                if not cat:                               # потом свой каталог (если есть)
-                    cat = norm_idx.get(e["shop"], {}).get(n)
+                cat = ni.get(norm_sku(sku))
                 if cat:
                     matched += 1
                     tag = cat
@@ -331,6 +331,16 @@ def probe(resp):
         print(f"\nВсего артикулов: {total} | с категорией: {matched} | без категории: {notfound}")
         if ex_nf:
             print("Без категории (примеры):", ", ".join(ex_nf))
+
+        # --- диагностика: размеры каталогов + есть ли пропавшие артикулы в Black-street ---
+        print("\n=== ДИАГНОСТИКА КАТАЛОГОВ ===")
+        for shop, idx in prom_idx.items():
+            print(f"  {shop}: товаров в каталоге = {len(idx)}")
+        bs = norm_idx.get("Black-street", {})
+        for t in ["Ads-419", "Sta-200", "Rap-RD387", "Ads-637", "Arm-TN12", "Will-K0030"]:
+            n = norm_sku(t)
+            print(f"  Black-street содержит {t!r} (norm={n!r})? -> "
+                  f"{('ДА: ' + str(bs[n])) if n in bs else 'НЕТ'}")
 
 
 def main():
