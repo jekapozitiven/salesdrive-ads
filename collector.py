@@ -271,6 +271,13 @@ def probe(resp):
     for s, n in sj.most_common(10):
         print(f"  {s!r}: {n}")
 
+    # распределение statusId + справочник статусов из meta (id -> назва)
+    print("\n=== statusId В ЗАКАЗАХ ===")
+    for sid, n in Counter(x.get("statusId") for x in orders).most_common():
+        print(f"  {sid}: {n}")
+    print("\n=== META (ищем справочник статусов id->назва) ===")
+    print(json.dumps(resp.get("meta"), ensure_ascii=False)[:4000])
+
     # === КАТЕГОРИЯ ПО АРТИКУЛУ через воркер «Товары» (/lookup) ===
     # Воркер сам нормализует артикул и связывает магазины по алиасам.
     print(f"\n=== КАТЕГОРИЯ ПО АРТИКУЛУ (через {WORKER_URL}/lookup) ===")
