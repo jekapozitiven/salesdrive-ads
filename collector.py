@@ -306,6 +306,71 @@ def probe(resp):
         print("Без категории (примеры):", ", ".join(ex_nf))
 
 
+FIREBASE_DB_URL = os.environ.get("FIREBASE_DB_URL", "").strip().rstrip("/")
+# статусы SalesDrive, которые считаем «апрув» (через запятую в секрете APRUV_STATUS).
+APRUV_STATUS = {s.strip() for s in os.environ.get("APRUV_STATUS", "").split(",") if s.strip()}
+MIXED_KEY = "__потребує_розподілу__"
+
+
+def fbkey(s):
+    """Ключ Firebase без запрещённых символов . $ # / [ ]."""
+    return re.sub(r"[.$#/\[\]]", "_", str(s)).strip() or "_"
+
+
+def order_categories(e):
+    """Список уникальных категорий по артикулам основного товара заказа."""
+    cats = []
+    for sku in e["skus"]:
+        c = category_of(sku)
+        if c and c not in cats:
+            cats.append(c)
+    return cats
+
+
+def aggregate(orders):
+    """Агрегаты по источник -> день -> категория(кампания). Смешанные -> отдельная корзина."""
+    agg = {}
+    for x in orders:
+        e = extract(x)
+        if e["source"] not in WANTED_SOURCES:
+            continue
+        day = e["date"]
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", day or ""):
+            continue
+        cats = order_categories(e)
+        if len(cats) > 1:
+            catkey, catname = MIXED_KEY, "Потребує розподілу (кілька категорій)"
+        elif cats:
+            catkey, catname = fbkey(cats[0]), cats[0]
+        else:
+            catkey, catname = "_no_cat", "(без категорії)"
+        cell = agg.setdefault(fbkey(e["source"]), {}).setdefault(day, {}).setdefault(catkey, {
+            "cat": catname, "leads": 0, "approved": 0, "sum": 0.0,
+            "upsCount": 0, "upsSum": 0.0, "extIds": [],
+        })
+        cell["leads"] += 1
+        cell["sum"] += e["mainSum"]
+        if str(x.get("statusId")) in APRUV_STATUS:
+            cell["approved"] += 1
+        if e["upsells"]:
+            cell["upsCount"] += 1
+            cell["upsSum"] += e["upsellSum"]
+        if e["externalId"] and len(cell["extIds"]) < 500:
+            cell["extIds"].append(str(e["externalId"]))
+    return agg
+
+
+def push_ads_firebase(agg):
+    """PUT агрегатов в shop-reports/ads (только эта ветка)."""
+    if not FIREBASE_DB_URL:
+        print("FIREBASE_DB_URL пуст — агрегаты не записаны (только показ).")
+        return
+    url = f"{FIREBASE_DB_URL}/shop-reports/ads.json"
+    r = requests.put(url, data=json.dumps(agg, ensure_ascii=False).encode("utf-8"),
+                     headers={"Content-Type": "application/json"}, timeout=60)
+    print(f"Firebase ads: HTTP {r.status_code}, источников={len(agg)}")
+
+
 def main():
     if not SD_URL or not SD_KEY:
         raise SystemExit("Нет SALESDRIVE_URL или SALESDRIVE_API_KEY — положи в Secrets/Variables.")
@@ -316,19 +381,28 @@ def main():
         probe(fetch_page(1, date_from))
         return
 
-    # обычный прогон (пока только выгрузка — этап 2 добавим после сверки полей)
     orders = fetch_all(date_from)
     print(f"Всего заказов за период: {len(orders)}")
-    with open("orders_sample.json", "w", encoding="utf-8") as f:
-        json.dump(orders[:50], f, ensure_ascii=False, indent=2)
-    print("Сохранил orders_sample.json (первые 50) — для сверки полей.")
-    # --- ЭТАП 2 (добавим, когда подтвердим имена полей и появятся API магазинов) ---
-    # 1) для каждого заказа: внешний_№, артикул(ы), статус, дата
-    # 2) артикул -> категория (API магазина Prom/Horoshop, кэш)
-    # 3) категория -> кампания (маппинг из Firebase, редактируется во вкладке)
-    # 4) джойн по внешнему_№ с MyDrop -> дроп-цена, продажная, маржа, апрув
-    # 5) агрегаты по кампаниям/дням -> Firebase shop-reports/ads/<магазин>/<кампания>/<день>
-    # 6) заказы со смешанными категориями -> в узел "нужно распределить"
+    agg = aggregate(orders)
+
+    # сводка в лог (проверка перед записью)
+    print("\n=== СВОДКА ПО КАМПАНИЯМ ===")
+    for src in sorted(agg):
+        tot = {}
+        for day, cats in agg[src].items():
+            for ck, c in cats.items():
+                t = tot.setdefault(ck, {"cat": c["cat"], "leads": 0, "approved": 0, "sum": 0.0, "upsSum": 0.0})
+                t["leads"] += c["leads"]; t["approved"] += c["approved"]
+                t["sum"] += c["sum"]; t["upsSum"] += c["upsSum"]
+        print(f"\n[{src}]")
+        for ck, t in sorted(tot.items(), key=lambda kv: -kv[1]["leads"]):
+            print(f"  {t['cat'][:45]:<45} заявок={t['leads']:>4} апрув={t['approved']:>4} "
+                  f"сума={t['sum']:>10.0f} допрод={t['upsSum']:>8.0f}")
+
+    if not APRUV_STATUS:
+        print("\n(!) APRUV_STATUS не задан — 'апрув' везде 0. Добавь секрет APRUV_STATUS "
+              "со списком id статусов-апрув через запятую.")
+    push_ads_firebase(agg)
 
 
 if __name__ == "__main__":
