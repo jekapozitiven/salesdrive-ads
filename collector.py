@@ -275,8 +275,21 @@ def probe(resp):
     print("\n=== statusId В ЗАКАЗАХ ===")
     for sid, n in Counter(x.get("statusId") for x in orders).most_common():
         print(f"  {sid}: {n}")
-    print("\n=== META (ищем справочник статусов id->назва) ===")
-    print(json.dumps(resp.get("meta"), ensure_ascii=False)[:4000])
+    print("\n=== СПРАВОЧНИК СТАТУСОВ (id -> назва) ===")
+    fields = (resp.get("meta") or {}).get("fields") or {}
+    stf = None
+    for fk, fv in fields.items():
+        lab = str((fv or {}).get("label", "")).lower()
+        if fk.lower() in ("statusid", "status") or "статус" in lab or "status" in lab:
+            stf = (fk, fv)
+            break
+    if stf:
+        fk, fv = stf
+        print(f"поле: {fk} ({fv.get('label')})")
+        for opt in (fv.get("options") or []):
+            print(f"  id={opt.get('value')} -> {opt.get('text')}")
+    else:
+        print("поле статуса не нашёл. Ключи meta.fields:", list(fields.keys()))
 
     # === КАТЕГОРИЯ ПО АРТИКУЛУ через воркер «Товары» (/lookup) ===
     # Воркер сам нормализует артикул и связывает магазины по алиасам.
