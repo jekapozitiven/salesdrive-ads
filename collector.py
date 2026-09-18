@@ -107,6 +107,61 @@ def norm_sku(s):
     return re.sub(r"\s+", "", s).lower()
 
 
+def _hs_cat(p):
+    """Достаём имя категории из товара Horoshop (parent — путь/объект/список/id)."""
+    cat = p.get("parent")
+    if isinstance(cat, dict):
+        cat = cat.get("title") or cat.get("name") or cat.get("id")
+    if isinstance(cat, list):
+        cat = cat[-1] if cat else None
+        if isinstance(cat, dict):
+            cat = cat.get("title") or cat.get("name") or cat.get("id")
+    if isinstance(cat, str) and ("\\" in cat or "/" in cat):
+        cat = re.split(r"[\\/]", cat)[-1].strip()
+    return cat
+
+
+def horoshop_catalog(domain, login, password, cap=40000):
+    """Полный каталог сайта Horoshop: артикул -> категория."""
+    idx = {}
+    domain = domain.replace("https://", "").replace("http://", "").strip("/")
+    try:
+        r = requests.post(f"https://{domain}/api/auth/",
+                          json={"login": login, "password": password}, timeout=30)
+        j = r.json()
+        tok = (j.get("response") or {}).get("token") if isinstance(j.get("response"), dict) else None
+        tok = tok or j.get("token")
+    except Exception as e:
+        print(f"  Horoshop {domain}: ошибка авторизации ({e})")
+        return idx
+    if not tok:
+        print(f"  Horoshop {domain}: не пришёл токен. Ответ: {str(j)[:200]}")
+        return idx
+    offset = 0
+    while offset < cap:
+        try:
+            r = requests.post(f"https://{domain}/api/products/get/",
+                              json={"token": tok, "limit": 500, "offset": offset}, timeout=60)
+        except Exception as e:
+            print(f"  Horoshop {domain}: ошибка запроса товаров ({e})"); break
+        if r.status_code != 200:
+            print(f"  Horoshop {domain} HTTP {r.status_code}: {r.text[:200]}"); break
+        j = r.json()
+        prods = (j.get("response") or {}).get("products") if isinstance(j.get("response"), dict) else None
+        prods = prods or j.get("products") or []
+        if not prods:
+            break
+        for p in prods:
+            art = (p.get("article") or p.get("parent_article") or "").strip()
+            if art:
+                idx[art] = _hs_cat(p)
+        offset += len(prods)
+        if len(prods) < 500:
+            break
+        time.sleep(0.3)
+    return idx
+
+
 # Источник в MyDrop по логике: сайт (домен) + Витрати (expensesAmount).
 # Витрати пусто -> "Сайт-<магазин>" (Google-трафик, НУЖЕН);
 # Витрати есть  -> "Prom-<магазин>" (Пром, НЕ нужен);
@@ -284,16 +339,17 @@ def probe(resp):
     for s, n in sj.most_common(10):
         print(f"  {s!r}: {n}")
 
-    # --- КАТЕГОРИЯ ПО АРТИКУЛУ через Prom (Black-street/Bonna) ---
+    # --- Prom-каталоги (по умолчанию ВЫКЛ: Prom = подмножество витрины, ~536/1719.
+    #     Полный каталог берём из Horoshop сайта ниже. Включить: SD_PROM=1) ---
     prom_idx = {}
-    for shop, tok in PROM_TOKENS.items():
-        if not tok:
-            print(f"\n[Prom] нет токена для {shop} (секрет пустой) — пропускаю")
-            continue
-        print(f"\n[Prom] тяну каталог {shop}…")
-        idx = prom_catalog(tok)
-        print(f"[Prom] {shop}: товаров с артикулом = {len(idx)}")
-        prom_idx[shop] = idx
+    if os.environ.get("SD_PROM", "").strip() in ("1", "true", "yes"):
+        for shop, tok in PROM_TOKENS.items():
+            if not tok:
+                print(f"\n[Prom] нет токена для {shop} — пропускаю")
+                continue
+            print(f"\n[Prom] тяну каталог {shop}…")
+            prom_idx[shop] = prom_catalog(tok)
+            print(f"[Prom] {shop}: товаров = {len(prom_idx[shop])}")
 
     if prom_idx:
         # нормализованный индекс каждого каталога: база артикула -> категория
@@ -341,6 +397,40 @@ def probe(resp):
             n = norm_sku(t)
             print(f"  Black-street содержит {t!r} (norm={n!r})? -> "
                   f"{('ДА: ' + str(bs[n])) if n in bs else 'НЕТ'}")
+
+    # === Horoshop: полный каталог сайта как ЭТАЛОН (полнее Prom) ===
+    if HOROSHOP["domain"] and HOROSHOP["login"] and HOROSHOP["password"]:
+        print(f"\n[Horoshop] тяну каталог {HOROSHOP['domain']}…")
+        hs = horoshop_catalog(HOROSHOP["domain"], HOROSHOP["login"], HOROSHOP["password"])
+        print(f"[Horoshop] товаров = {len(hs)}")
+        if hs:
+            print("  пример:", dict(list(hs.items())[:3]))
+        hmaster = {}
+        for art, cat in hs.items():
+            hmaster.setdefault(norm_sku(art), cat)
+        print(f"[Horoshop ЭТАЛОН] уникальных баз = {len(hmaster)}")
+        for t in ["Ads-419", "Sta-200", "Rap-RD387", "Ads-637", "Will-K0030"]:
+            n = norm_sku(t)
+            print(f"  эталон содержит {t!r}? -> {('ДА: ' + str(hmaster[n])) if n in hmaster else 'НЕТ'}")
+        total = matched = 0
+        ex = []
+        for x in orders:
+            e = extract(x)
+            if e["source"] not in ("Сайт-Black-street", "Сайт-Bonna-shop", "Хор-Blink"):
+                continue
+            for sku in e["skus"]:
+                if not sku:
+                    continue
+                total += 1
+                if hmaster.get(norm_sku(sku)):
+                    matched += 1
+                elif len(ex) < 15:
+                    ex.append(f"{e['shop']}:{sku!r}")
+        print(f"\n[Horoshop эталон] покрытие: {matched}/{total}")
+        if ex:
+            print("Без категории (примеры):", ", ".join(ex))
+    else:
+        print("\n[Horoshop] нет доступа (HOROSHOP_DOMAIN/LOGIN/PASSWORD пустые) — пропускаю")
 
 
 def main():
