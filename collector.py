@@ -70,7 +70,7 @@ def shop_of(order):
     return "?"
 
 
-def prom_catalog(token, cap=30000):
+def prom_catalog(token, cap=80000):
     """Артикул -> категория (group.name) из Prom API."""
     idx, url = {}, "https://my.prom.ua/api/v1/products/list"
     headers = {"Authorization": "Bearer " + token}
@@ -91,7 +91,10 @@ def prom_catalog(token, cap=30000):
             if sku:
                 idx[sku] = (p.get("group") or {}).get("name")
         got += len(prods)
-        last = min((p.get("id") or 0) for p in prods)   # надёжно для пагинации по last_id
+        new_last = max((p.get("id") or 0) for p in prods)   # курсор ВПЕРЁД: наибольший id
+        if new_last == last:                                # прогресса нет — стоп
+            break
+        last = new_last
         if len(prods) < 100:
             break
         time.sleep(0.3)
@@ -339,98 +342,70 @@ def probe(resp):
     for s, n in sj.most_common(10):
         print(f"  {s!r}: {n}")
 
-    # --- Prom-каталоги (по умолчанию ВЫКЛ: Prom = подмножество витрины, ~536/1719.
-    #     Полный каталог берём из Horoshop сайта ниже. Включить: SD_PROM=1) ---
-    prom_idx = {}
-    if os.environ.get("SD_PROM", "").strip() in ("1", "true", "yes"):
-        for shop, tok in PROM_TOKENS.items():
-            if not tok:
-                print(f"\n[Prom] нет токена для {shop} — пропускаю")
-                continue
-            print(f"\n[Prom] тяну каталог {shop}…")
-            prom_idx[shop] = prom_catalog(tok)
-            print(f"[Prom] {shop}: товаров = {len(prom_idx[shop])}")
+    # === КАТЕГОРИИ: у каждого магазина свой каталог ===
+    #   Black-street, Bonna-shop = Prom (магазины на своём домене) -> TOKEN_*
+    #   Blink = Horoshop (blink.in.ua) -> HOROSHOP_*
+    shop_idx = {}   # магазин -> {норм.артикул: категория}
 
-    if prom_idx:
-        # нормализованный индекс каждого каталога: база артикула -> категория
-        norm_idx = {}
-        for shop, idx in prom_idx.items():
-            ni = {}
-            for sku, cat in idx.items():
-                ni.setdefault(norm_sku(sku), cat)
-            norm_idx[shop] = ni
-            print(f"[Prom] {shop}: артикулов={len(idx)}, уникальных баз={len(ni)}")
-        print("\n=== КАТЕГОРИЯ ПО АРТИКУЛУ (каждый магазин — свой каталог) ===")
-        total = matched = notfound = shown = 0
-        ex_nf = []
-        for x in orders:
-            e = extract(x)
-            if e["source"] not in ("Сайт-Black-street", "Сайт-Bonna-shop", "Хор-Blink"):
-                continue
-            ni = norm_idx.get(e["shop"], {})
-            for sku in e["skus"]:
-                if not sku:
-                    continue
-                total += 1
-                cat = ni.get(norm_sku(sku))
-                if cat:
-                    matched += 1
-                    tag = cat
-                else:
-                    notfound += 1
-                    tag = "(нет категории)"
-                    if len(ex_nf) < 15:
-                        ex_nf.append(f"{e['shop']}:{sku!r}")
-                if shown < 18:
-                    print(f"  {e['shop']}: {sku!r} -> {tag}")
-                    shown += 1
-        print(f"\nВсего артикулов: {total} | с категорией: {matched} | без категории: {notfound}")
-        if ex_nf:
-            print("Без категории (примеры):", ", ".join(ex_nf))
+    for shop, tok in (("Black-street", PROM_TOKENS["Black-street"]),
+                      ("Bonna-shop", PROM_TOKENS["Bonna-shop"])):
+        if not tok:
+            print(f"\n[Prom] нет токена для {shop} — пропускаю")
+            continue
+        print(f"\n[Prom] тяну каталог {shop}…")
+        raw = prom_catalog(tok)
+        ni = {}
+        for sku, cat in raw.items():
+            ni.setdefault(norm_sku(sku), cat)
+        shop_idx[shop] = ni
+        print(f"[Prom] {shop}: товаров={len(raw)}, уникальных баз={len(ni)}")
 
-        # --- диагностика: размеры каталогов + есть ли пропавшие артикулы в Black-street ---
-        print("\n=== ДИАГНОСТИКА КАТАЛОГОВ ===")
-        for shop, idx in prom_idx.items():
-            print(f"  {shop}: товаров в каталоге = {len(idx)}")
-        bs = norm_idx.get("Black-street", {})
-        for t in ["Ads-419", "Sta-200", "Rap-RD387", "Ads-637", "Arm-TN12", "Will-K0030"]:
-            n = norm_sku(t)
-            print(f"  Black-street содержит {t!r} (norm={n!r})? -> "
-                  f"{('ДА: ' + str(bs[n])) if n in bs else 'НЕТ'}")
-
-    # === Horoshop: полный каталог сайта как ЭТАЛОН (полнее Prom) ===
     if HOROSHOP["domain"] and HOROSHOP["login"] and HOROSHOP["password"]:
-        print(f"\n[Horoshop] тяну каталог {HOROSHOP['domain']}…")
-        hs = horoshop_catalog(HOROSHOP["domain"], HOROSHOP["login"], HOROSHOP["password"])
-        print(f"[Horoshop] товаров = {len(hs)}")
-        if hs:
-            print("  пример:", dict(list(hs.items())[:3]))
-        hmaster = {}
-        for art, cat in hs.items():
-            hmaster.setdefault(norm_sku(art), cat)
-        print(f"[Horoshop ЭТАЛОН] уникальных баз = {len(hmaster)}")
-        for t in ["Ads-419", "Sta-200", "Rap-RD387", "Ads-637", "Will-K0030"]:
-            n = norm_sku(t)
-            print(f"  эталон содержит {t!r}? -> {('ДА: ' + str(hmaster[n])) if n in hmaster else 'НЕТ'}")
-        total = matched = 0
-        ex = []
-        for x in orders:
-            e = extract(x)
-            if e["source"] not in ("Сайт-Black-street", "Сайт-Bonna-shop", "Хор-Blink"):
-                continue
-            for sku in e["skus"]:
-                if not sku:
-                    continue
-                total += 1
-                if hmaster.get(norm_sku(sku)):
-                    matched += 1
-                elif len(ex) < 15:
-                    ex.append(f"{e['shop']}:{sku!r}")
-        print(f"\n[Horoshop эталон] покрытие: {matched}/{total}")
-        if ex:
-            print("Без категории (примеры):", ", ".join(ex))
+        print(f"\n[Horoshop] тяну каталог {HOROSHOP['domain']} (Blink)…")
+        raw = horoshop_catalog(HOROSHOP["domain"], HOROSHOP["login"], HOROSHOP["password"])
+        if raw:
+            print("  пример:", dict(list(raw.items())[:3]))
+        ni = {}
+        for sku, cat in raw.items():
+            ni.setdefault(norm_sku(sku), cat)
+        shop_idx["Blink"] = ni
+        print(f"[Horoshop] Blink: товаров={len(raw)}, уникальных баз={len(ni)}")
     else:
-        print("\n[Horoshop] нет доступа (HOROSHOP_DOMAIN/LOGIN/PASSWORD пустые) — пропускаю")
+        print("\n[Horoshop] нет доступа для Blink (HOROSHOP_* пустые)")
+
+    # резолв категорий по каждому заказу через каталог его магазина
+    print("\n=== КАТЕГОРИЯ ПО АРТИКУЛУ (у каждого свой каталог) ===")
+    total = matched = shown = 0
+    per_t = Counter()
+    per_m = Counter()
+    ex_nf = []
+    for x in orders:
+        e = extract(x)
+        if e["source"] not in ("Сайт-Black-street", "Сайт-Bonna-shop", "Хор-Blink"):
+            continue
+        ni = shop_idx.get(e["shop"], {})
+        for sku in e["skus"]:
+            if not sku:
+                continue
+            total += 1
+            per_t[e["shop"]] += 1
+            cat = ni.get(norm_sku(sku))
+            if cat:
+                matched += 1
+                per_m[e["shop"]] += 1
+                tag = cat
+            else:
+                tag = "(нет категории)"
+                if len(ex_nf) < 15:
+                    ex_nf.append(f"{e['shop']}:{sku!r}")
+            if shown < 18:
+                print(f"  {e['shop']}: {sku!r} -> {tag}")
+                shown += 1
+    print(f"\nВсего артикулов: {total} | с категорией: {matched} | без: {total - matched}")
+    for shop in per_t:
+        print(f"  {shop}: {per_m[shop]}/{per_t[shop]}")
+    if ex_nf:
+        print("Без категории (примеры):", ", ".join(ex_nf))
 
 
 def main():
