@@ -11,9 +11,8 @@ on:
         description: "За сколько последних дней тянуть"
         required: false
         default: "14"
-  # Расписание включим на ЭТАПЕ 2 (когда пойдёт запись в Firebase):
-  # schedule:
-  #   - cron: "5 * * * *"   # каждый час в :05
+  schedule:
+    - cron: "15 * * * *"   # каждый час в :15 — боевой прогон (probe=0), пишет в Firebase   # каждый час в :05
 
 jobs:
   collect:
@@ -29,7 +28,8 @@ jobs:
           SALESDRIVE_URL: ${{ secrets.SALESDRIVE_URL }}
           SALESDRIVE_API_KEY: ${{ secrets.SALESDRIVE_API_KEY }}
           SD_DAYS: ${{ github.event.inputs.days || '14' }}
-          SD_PROBE: ${{ github.event.inputs.probe || '1' }}
+          # по расписанию inputs пусты -> '0' (боевой). При ручном запуске берётся поле формы.
+          SD_PROBE: ${{ github.event.inputs.probe || '0' }}
           # категорию берём из воркера «Товары» (публичный /lookup) — токены не нужны.
           # id статусов SalesDrive, которые = апрув (через запятую), напр. "6,9,11":
           APRUV_STATUS: ${{ secrets.APRUV_STATUS }}
