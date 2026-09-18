@@ -337,6 +337,13 @@ def fbkey(s):
     return re.sub(r"[.$#/\[\]]", "_", str(s)).strip() or "_"
 
 
+def _num(v):
+    try:
+        return float(v)
+    except Exception:
+        return 0.0
+
+
 def order_categories(e):
     """Список уникальных категорий по артикулам основного товара заказа."""
     cats = []
@@ -347,8 +354,10 @@ def order_categories(e):
     return cats
 
 
-def aggregate(orders):
-    """Агрегаты по источник -> день -> категория(кампания). Смешанные -> отдельная корзина."""
+def aggregate(orders, margin_by_ext=None):
+    """Агрегаты по источник -> день -> категория(кампания). Смешанные -> отдельная корзина.
+    margin_by_ext: {внешний_номер: маржа} из MyDrop (по externalId заказа)."""
+    mbe = margin_by_ext or {}
     agg = {}
     for x in orders:
         e = extract(x)
@@ -366,7 +375,7 @@ def aggregate(orders):
             catkey, catname = "_no_cat", "(без категорії)"
         cell = agg.setdefault(fbkey(e["source"]), {}).setdefault(day, {}).setdefault(catkey, {
             "cat": catname, "leads": 0, "approved": 0, "sum": 0.0,
-            "upsCount": 0, "upsSum": 0.0, "extIds": [],
+            "upsCount": 0, "upsSum": 0.0, "margin": 0.0, "extIds": [],
         })
         cell["leads"] += 1
         cell["sum"] += e["mainSum"]
@@ -375,6 +384,7 @@ def aggregate(orders):
         if e["upsells"]:
             cell["upsCount"] += 1
             cell["upsSum"] += e["upsellSum"]
+        cell["margin"] += mbe.get(str(e["externalId"]), 0.0)
         if e["externalId"] and len(cell["extIds"]) < 500:
             cell["extIds"].append(str(e["externalId"]))
     return agg
@@ -431,6 +441,71 @@ def mydrop_fetch(days, max_pages=80):
     return out
 
 
+def _extnum(detail):
+    """Внешний номер заказа из карточки MyDrop (первое непустое из четырёх полей)."""
+    d = detail.get("data") if isinstance(detail.get("data"), dict) else detail
+    for k in ("externalOrderId", "promOrderId", "horoshopOrderId", "externalId"):
+        v = d.get(k)
+        if v not in (None, "", 0, "0"):
+            return str(v)
+    return ""
+
+
+def mydrop_detail(oid, headers):
+    url = f"{MYDROP_URL.rstrip('/')}/{oid}"
+    try:
+        r = requests.get(url, headers=headers, timeout=30)
+        if r.status_code == 200:
+            return r.json() or {}
+    except Exception:
+        pass
+    return {}
+
+
+def build_margin_index(md_orders):
+    """Строит {внешний_номер: маржа}. Кэш id->внешний_номер в Firebase (тянем карточки
+    только для новых заказов, маржу берём из списка — она дозревает)."""
+    from concurrent.futures import ThreadPoolExecutor
+    headers = {"X-API-KEY": MYDROP_KEY, "Accept": "application/json"}
+    cache = {}
+    if FIREBASE_DB_URL:
+        try:
+            r = requests.get(f"{FIREBASE_DB_URL}/shop-reports/ads-md-index.json", timeout=40)
+            if r.status_code == 200:
+                cache = r.json() or {}
+        except Exception:
+            pass
+    ids = [str(m.get("id")) for m in md_orders if m.get("id")]
+    missing = [i for i in ids if i not in cache]
+    cap = int(os.environ.get("MD_DETAIL_CAP", "700"))
+    missing = missing[:cap]
+    print(f"MyDrop-индекс: заказов {len(ids)}, в кэше {len(ids) - len([i for i in ids if i not in cache])}, "
+          f"дотягиваю карточек {len(missing)}")
+    if missing:
+        def work(i):
+            return i, _extnum(mydrop_detail(i, headers))
+        with ThreadPoolExecutor(max_workers=10) as ex:
+            for i, ext in ex.map(work, missing):
+                cache[i] = ext
+        if FIREBASE_DB_URL:
+            try:
+                requests.patch(f"{FIREBASE_DB_URL}/shop-reports/ads-md-index.json",
+                               data=json.dumps({i: cache[i] for i in missing}, ensure_ascii=False).encode("utf-8"),
+                               headers={"Content-Type": "application/json"}, timeout=60)
+            except Exception as e:
+                print(f"кэш индекса не сохранён: {e}")
+    mbe = {}
+    for m in md_orders:
+        ext = cache.get(str(m.get("id")))
+        if ext:
+            mar = 0.0
+            for mk in MARGIN_KEYS:
+                if mk in m:
+                    mar = _num(m.get(mk)); break
+            mbe[ext] = mar
+    return mbe
+
+
 def _flat_str_values(o, prefix="", depth=0, acc=None):
     """Плоский разбор: путь-к-полю -> множество строковых значений (до глубины 2)."""
     if acc is None:
@@ -482,6 +557,50 @@ def mydrop_probe(days):
             print(f"\nМаржа: поле '{mk}' = {o.get(mk)}")
             break
 
+    # --- проверка джойна по телефону и телефон+артикул ---
+    def norm_phone(p):
+        d = re.sub(r"\D", "", str(p or ""))
+        return d[-9:] if len(d) >= 9 else d
+
+    def sd_phone(x):
+        srcs = [(x.get("primaryContact") or {}).get("phone")]
+        srcs += [c.get("phone") for c in (x.get("contacts") or [])]
+        for s in srcs:
+            v = s[0] if isinstance(s, list) and s else s
+            n = norm_phone(v)
+            if n:
+                return n
+        return ""
+
+    def md_skus(m):
+        out = set()
+        for p in (m.get("products") or []):
+            sku = (p.get("product") or {}).get("sku") or p.get("sku") or ""
+            n = norm_sku(sku)
+            if n:
+                out.add(n)
+        return out
+
+    md_by_phone = {}
+    for m in md:
+        ph = norm_phone(m.get("phone"))
+        if ph:
+            md_by_phone.setdefault(ph, []).append(m)
+
+    tot = m_ph = m_phsku = 0
+    for x in sd:
+        e = extract(x)
+        if e["source"] not in WANTED_SOURCES:
+            continue
+        tot += 1
+        cands = md_by_phone.get(sd_phone(x), [])
+        if cands:
+            m_ph += 1
+            sdsk = {norm_sku(s) for s in e["skus"] if s}
+            if any(sdsk & md_skus(m) for m in cands):
+                m_phsku += 1
+    print(f"\nДЖОЙН: телефон {m_ph}/{tot}; телефон+артикул {m_phsku}/{tot}")
+
 
 def main():
     if os.environ.get("SD_MYDROP", "").strip() in ("1", "true", "yes"):
@@ -498,7 +617,19 @@ def main():
 
     orders = fetch_all(date_from)
     print(f"Всего заказов за период: {len(orders)}")
-    agg = aggregate(orders)
+
+    # маржа из MyDrop по внешнему номеру (если задан ключ)
+    mbe = {}
+    if MYDROP_KEY:
+        md = mydrop_fetch(DAYS)
+        print(f"MyDrop: заказов {len(md)}")
+        mbe = build_margin_index(md)
+        site = [extract(x) for x in orders]
+        site = [e for e in site if e["source"] in WANTED_SOURCES]
+        cov = sum(1 for e in site if str(e["externalId"]) in mbe)
+        print(f"Маржа сматчена: {cov}/{len(site)} сайтовых заказов")
+
+    agg = aggregate(orders, mbe)
 
     # сводка в лог (проверка перед записью)
     print("\n=== СВОДКА ПО КАМПАНИЯМ ===")
@@ -506,13 +637,13 @@ def main():
         tot = {}
         for day, cats in agg[src].items():
             for ck, c in cats.items():
-                t = tot.setdefault(ck, {"cat": c["cat"], "leads": 0, "approved": 0, "sum": 0.0, "upsSum": 0.0})
+                t = tot.setdefault(ck, {"cat": c["cat"], "leads": 0, "approved": 0, "sum": 0.0, "upsSum": 0.0, "margin": 0.0})
                 t["leads"] += c["leads"]; t["approved"] += c["approved"]
-                t["sum"] += c["sum"]; t["upsSum"] += c["upsSum"]
+                t["sum"] += c["sum"]; t["upsSum"] += c["upsSum"]; t["margin"] += c.get("margin", 0)
         print(f"\n[{src}]")
         for ck, t in sorted(tot.items(), key=lambda kv: -kv[1]["leads"]):
-            print(f"  {t['cat'][:45]:<45} заявок={t['leads']:>4} апрув={t['approved']:>4} "
-                  f"сума={t['sum']:>10.0f} допрод={t['upsSum']:>8.0f}")
+            print(f"  {t['cat'][:42]:<42} заявок={t['leads']:>4} апрув={t['approved']:>4} "
+                  f"сума={t['sum']:>9.0f} маржа={t['margin']:>8.0f} допрод={t['upsSum']:>7.0f}")
 
     if not APRUV_STATUS:
         print("\n(!) APRUV_STATUS не задан — 'апрув' везде 0. Добавь секрет APRUV_STATUS "
