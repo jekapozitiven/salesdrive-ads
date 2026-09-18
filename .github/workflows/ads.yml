@@ -11,6 +11,10 @@ on:
         description: "За сколько последних дней тянуть"
         required: false
         default: "14"
+      mydrop:
+        description: "Разведка MyDrop (поле связи + маржа): напиши 1"
+        required: false
+        default: ""
   schedule:
     - cron: "15 * * * *"   # каждый час в :15 — боевой прогон (probe=0), пишет в Firebase   # каждый час в :05
 
@@ -34,8 +38,9 @@ jobs:
           # id статусов SalesDrive, которые = апрув (через запятую), напр. "6,9,11":
           APRUV_STATUS: ${{ secrets.APRUV_STATUS }}
           FIREBASE_DB_URL: ${{ secrets.FIREBASE_DB_URL }}
-          # понадобится дальше (маржа/дроп):
+          # маржа/дроп из MyDrop:
           MYDROP_API_KEY: ${{ secrets.MYDROP_API_KEY }}
+          SD_MYDROP: ${{ github.event.inputs.mydrop }}
         run: python collector.py
 
       - name: Upload sample (если был обычный прогон)
