@@ -40,18 +40,33 @@ SHOP_DOMAINS = {
 # ID сайта в поле sajt -> магазин (надёжнее домена: есть даже без ссылки).
 SAJT_TO_SHOP = {"22": "Black-street", "21": "Bonna-shop", "19": "Blink"}
 
-# токены каталогов (категория по артикулу). Имена секретов — как у тебя.
-PROM_TOKENS = {
-    "Black-street": os.environ.get("TOKEN_BLACKSTREET", "").strip(),
-    "Bonna-shop":   os.environ.get("TOKEN_BONNA", "").strip(),
-    "Core22":       os.environ.get("TOKEN_CORE22", "").strip(),
-    "Street Code":  os.environ.get("TOKEN_STREETCODE", "").strip(),
-}
-HOROSHOP = {
-    "domain":   os.environ.get("HOROSHOP_DOMAIN", "").strip(),
-    "login":    os.environ.get("HOROSHOP_LOGIN", "").strip(),
-    "password": os.environ.get("HOROSHOP_PASSWORD", "").strip(),
-}
+# Категорию по артикулу берём из уже готового индекса приложения «Товары»
+# (Cloudflare Worker + KV). Он сам ходит в Prom/Horoshop, нормализует артикулы
+# и связывает магазины по алиасам. Токены магазинов сборщику НЕ нужны.
+WORKER_URL = os.environ.get(
+    "TOVARY_WORKER_URL", "https://cold-sea-36e7tovary.bonnashops.workers.dev").rstrip("/")
+
+_cat_cache = {}
+
+
+def category_of(sku):
+    """Артикул -> категория через /lookup воркера «Товары». С кэшем по артикулу."""
+    key = (sku or "").strip()
+    if not key:
+        return None
+    if key in _cat_cache:
+        return _cat_cache[key]
+    cat = None
+    try:
+        r = requests.post(WORKER_URL + "/lookup", json={"article": key}, timeout=20)
+        if r.status_code == 200:
+            j = r.json()
+            if j.get("found"):
+                cat = (j.get("product") or {}).get("category") or None
+    except Exception as e:
+        print(f"  lookup error {key!r}: {e}")
+    _cat_cache[key] = cat
+    return cat
 
 
 def _dom(h):
@@ -70,37 +85,6 @@ def shop_of(order):
     return "?"
 
 
-def prom_catalog(token, cap=80000):
-    """Артикул -> категория (group.name) из Prom API."""
-    idx, url = {}, "https://my.prom.ua/api/v1/products/list"
-    headers = {"Authorization": "Bearer " + token}
-    last, got = None, 0
-    while got < cap:
-        params = {"limit": 100}
-        if last:
-            params["last_id"] = last
-        r = requests.get(url, headers=headers, params=params, timeout=40)
-        if r.status_code != 200:
-            print(f"  Prom HTTP {r.status_code}: {r.text[:200]}")
-            break
-        prods = (r.json() or {}).get("products", [])
-        if not prods:
-            break
-        for p in prods:
-            sku = (p.get("sku") or "").strip()
-            if sku:
-                idx[sku] = (p.get("group") or {}).get("name")
-        got += len(prods)
-        new_last = max((p.get("id") or 0) for p in prods)   # курсор ВПЕРЁД: наибольший id
-        if new_last == last:                                # прогресса нет — стоп
-            break
-        last = new_last
-        if len(prods) < 100:
-            break
-        time.sleep(0.3)
-    return idx
-
-
 def norm_sku(s):
     """База артикула без вариаций. База — заглавными, вариации — строчными/в скобках."""
     s = (s or "").strip()
@@ -108,61 +92,6 @@ def norm_sku(s):
     s = s.split("/")[0].strip()        # компаунд "Rap-RD266/RD015" -> "Rap-RD266"
     s = re.sub(r"[a-z]\d*$", "", s)     # хвост-вариация строчными: q2, q, l (базы — ЗАГЛАВНЫМИ)
     return re.sub(r"\s+", "", s).lower()
-
-
-def _hs_cat(p):
-    """Достаём имя категории из товара Horoshop (parent — путь/объект/список/id)."""
-    cat = p.get("parent")
-    if isinstance(cat, dict):
-        cat = cat.get("title") or cat.get("name") or cat.get("id")
-    if isinstance(cat, list):
-        cat = cat[-1] if cat else None
-        if isinstance(cat, dict):
-            cat = cat.get("title") or cat.get("name") or cat.get("id")
-    if isinstance(cat, str) and ("\\" in cat or "/" in cat):
-        cat = re.split(r"[\\/]", cat)[-1].strip()
-    return cat
-
-
-def horoshop_catalog(domain, login, password, cap=40000):
-    """Полный каталог сайта Horoshop: артикул -> категория."""
-    idx = {}
-    domain = domain.replace("https://", "").replace("http://", "").strip("/")
-    try:
-        r = requests.post(f"https://{domain}/api/auth/",
-                          json={"login": login, "password": password}, timeout=30)
-        j = r.json()
-        tok = (j.get("response") or {}).get("token") if isinstance(j.get("response"), dict) else None
-        tok = tok or j.get("token")
-    except Exception as e:
-        print(f"  Horoshop {domain}: ошибка авторизации ({e})")
-        return idx
-    if not tok:
-        print(f"  Horoshop {domain}: не пришёл токен. Ответ: {str(j)[:200]}")
-        return idx
-    offset = 0
-    while offset < cap:
-        try:
-            r = requests.post(f"https://{domain}/api/products/get/",
-                              json={"token": tok, "limit": 500, "offset": offset}, timeout=60)
-        except Exception as e:
-            print(f"  Horoshop {domain}: ошибка запроса товаров ({e})"); break
-        if r.status_code != 200:
-            print(f"  Horoshop {domain} HTTP {r.status_code}: {r.text[:200]}"); break
-        j = r.json()
-        prods = (j.get("response") or {}).get("products") if isinstance(j.get("response"), dict) else None
-        prods = prods or j.get("products") or []
-        if not prods:
-            break
-        for p in prods:
-            art = (p.get("article") or p.get("parent_article") or "").strip()
-            if art:
-                idx[art] = _hs_cat(p)
-        offset += len(prods)
-        if len(prods) < 500:
-            break
-        time.sleep(0.3)
-    return idx
 
 
 # Источник в MyDrop по логике: сайт (домен) + Витрати (expensesAmount).
@@ -342,39 +271,9 @@ def probe(resp):
     for s, n in sj.most_common(10):
         print(f"  {s!r}: {n}")
 
-    # === КАТЕГОРИИ: у каждого магазина свой каталог ===
-    #   Black-street, Bonna-shop = Prom (магазины на своём домене) -> TOKEN_*
-    #   Blink = Horoshop (blink.in.ua) -> HOROSHOP_*
-    shop_idx = {}   # магазин -> {норм.артикул: категория}
-
-    for shop, tok in (("Black-street", PROM_TOKENS["Black-street"]),
-                      ("Bonna-shop", PROM_TOKENS["Bonna-shop"])):
-        if not tok:
-            print(f"\n[Prom] нет токена для {shop} — пропускаю")
-            continue
-        print(f"\n[Prom] тяну каталог {shop}…")
-        raw = prom_catalog(tok)
-        ni = {}
-        for sku, cat in raw.items():
-            ni.setdefault(norm_sku(sku), cat)
-        shop_idx[shop] = ni
-        print(f"[Prom] {shop}: товаров={len(raw)}, уникальных баз={len(ni)}")
-
-    if HOROSHOP["domain"] and HOROSHOP["login"] and HOROSHOP["password"]:
-        print(f"\n[Horoshop] тяну каталог {HOROSHOP['domain']} (Blink)…")
-        raw = horoshop_catalog(HOROSHOP["domain"], HOROSHOP["login"], HOROSHOP["password"])
-        if raw:
-            print("  пример:", dict(list(raw.items())[:3]))
-        ni = {}
-        for sku, cat in raw.items():
-            ni.setdefault(norm_sku(sku), cat)
-        shop_idx["Blink"] = ni
-        print(f"[Horoshop] Blink: товаров={len(raw)}, уникальных баз={len(ni)}")
-    else:
-        print("\n[Horoshop] нет доступа для Blink (HOROSHOP_* пустые)")
-
-    # резолв категорий по каждому заказу через каталог его магазина
-    print("\n=== КАТЕГОРИЯ ПО АРТИКУЛУ (у каждого свой каталог) ===")
+    # === КАТЕГОРИЯ ПО АРТИКУЛУ через воркер «Товары» (/lookup) ===
+    # Воркер сам нормализует артикул и связывает магазины по алиасам.
+    print(f"\n=== КАТЕГОРИЯ ПО АРТИКУЛУ (через {WORKER_URL}/lookup) ===")
     total = matched = shown = 0
     per_t = Counter()
     per_m = Counter()
@@ -383,13 +282,12 @@ def probe(resp):
         e = extract(x)
         if e["source"] not in ("Сайт-Black-street", "Сайт-Bonna-shop", "Хор-Blink"):
             continue
-        ni = shop_idx.get(e["shop"], {})
         for sku in e["skus"]:
             if not sku:
                 continue
             total += 1
             per_t[e["shop"]] += 1
-            cat = ni.get(norm_sku(sku))
+            cat = category_of(sku)
             if cat:
                 matched += 1
                 per_m[e["shop"]] += 1
