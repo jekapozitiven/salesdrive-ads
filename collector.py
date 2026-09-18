@@ -391,7 +391,102 @@ def push_ads_firebase(agg):
     print(f"Firebase ads: HTTP {r.status_code}, источников={len(agg)}")
 
 
+MYDROP_KEY = os.environ.get("MYDROP_API_KEY", "").strip()
+MYDROP_URL = os.environ.get("MYDROP_BASE_URL",
+                            "https://backend.mydrop.com.ua/dropshipper/api/orders").strip()
+MARGIN_KEYS = ("realMargin", "margin", "real_margin")
+
+
+def mydrop_fetch(days, max_pages=80):
+    """Заказы MyDrop за последние `days` дней (для джойна по внешнему номеру)."""
+    if not MYDROP_KEY:
+        print("Нет MYDROP_API_KEY — MyDrop пропускаю.")
+        return []
+    headers = {"X-API-KEY": MYDROP_KEY, "Accept": "application/json"}
+    date_from = (dt.date.today() - dt.timedelta(days=days)).isoformat()
+    out, page = [], 1
+    while page <= max_pages:
+        params = {"date_type": "period", "date_start": date_from,
+                  "date_end": dt.date.today().isoformat(), "page": page}
+        r = requests.get(MYDROP_URL, headers=headers, params=params, timeout=40)
+        if r.status_code != 200:
+            print(f"MyDrop HTTP {r.status_code}: {r.text[:200]}")
+            break
+        j = r.json()
+        if isinstance(j, list):
+            batch, meta = j, {}
+        else:
+            batch = j.get("results") or j.get("data") or j.get("orders") or []
+            meta = j.get("meta") or {}
+        out += batch
+        tp = int(meta.get("totalPages") or meta.get("total_pages") or 0) or None
+        if not batch:
+            break
+        if tp and page >= tp:
+            break
+        if not tp and len(batch) < 20:
+            break
+        page += 1
+        time.sleep(0.2)
+    return out
+
+
+def _flat_str_values(o, prefix="", depth=0, acc=None):
+    """Плоский разбор: путь-к-полю -> множество строковых значений (до глубины 2)."""
+    if acc is None:
+        acc = {}
+    if depth > 2 or not isinstance(o, dict):
+        return acc
+    for k, v in o.items():
+        p = f"{prefix}.{k}" if prefix else str(k)
+        if isinstance(v, (str, int)):
+            acc.setdefault(p, set()).add(str(v))
+        elif isinstance(v, dict):
+            _flat_str_values(v, p, depth + 1, acc)
+    return acc
+
+
+def mydrop_probe(days):
+    # externalId сайтовых заказов SalesDrive
+    sd = fetch_all((dt.date.today() - dt.timedelta(days=days)).isoformat())
+    site_ext = {str(extract(x)["externalId"]) for x in sd
+                if extract(x)["source"] in WANTED_SOURCES and extract(x)["externalId"]}
+    print(f"SalesDrive: сайтовых заказов с externalId = {len(site_ext)}")
+
+    md = mydrop_fetch(days)
+    print(f"MyDrop: заказов = {len(md)}")
+    if not md:
+        return
+    o = md[0]
+    print("\n=== ПРИМЕР MyDrop-ЗАКАЗА (ключи) ===")
+    print(", ".join(sorted(str(k) for k in o.keys())))
+    print("\n=== JSON (обрезан) ===")
+    print(json.dumps(o, ensure_ascii=False)[:2500])
+
+    # авто-детект поля связи: какое поле MyDrop пересекается с externalId SalesDrive
+    field_vals = {}
+    for m in md:
+        for p, vals in _flat_str_values(m).items():
+            field_vals.setdefault(p, set()).update(vals)
+    hits = [(len(v & site_ext), p) for p, v in field_vals.items() if (v & site_ext)]
+    hits.sort(reverse=True)
+    print("\n=== ПОЛЯ MyDrop, СОВПАДАЮЩИЕ с externalId SalesDrive ===")
+    if hits:
+        for ov, p in hits[:8]:
+            print(f"  {p}: совпадений {ov}/{len(site_ext)}")
+    else:
+        print("  совпадений не найдено — externalId в MyDrop, видимо, лежит иначе (см. JSON выше)")
+
+    for mk in MARGIN_KEYS:
+        if mk in o:
+            print(f"\nМаржа: поле '{mk}' = {o.get(mk)}")
+            break
+
+
 def main():
+    if os.environ.get("SD_MYDROP", "").strip() in ("1", "true", "yes"):
+        mydrop_probe(DAYS)
+        return
     if not SD_URL or not SD_KEY:
         raise SystemExit("Нет SALESDRIVE_URL или SALESDRIVE_API_KEY — положи в Secrets/Variables.")
     date_from = (dt.date.today() - dt.timedelta(days=DAYS)).isoformat()
