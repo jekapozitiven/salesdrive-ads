@@ -484,13 +484,17 @@ def build_margin_index(md_orders):
     if missing:
         def work(i):
             return i, _extnum(mydrop_detail(i, headers))
+        new = {}
         with ThreadPoolExecutor(max_workers=10) as ex:
             for i, ext in ex.map(work, missing):
-                cache[i] = ext
-        if FIREBASE_DB_URL:
+                if ext:                       # кэшируем только удачные; пустые перепробуем позже
+                    cache[i] = ext
+                    new[i] = ext
+        print(f"  новых номеров закэшировано: {len(new)}")
+        if FIREBASE_DB_URL and new:
             try:
                 requests.patch(f"{FIREBASE_DB_URL}/shop-reports/ads-md-index.json",
-                               data=json.dumps({i: cache[i] for i in missing}, ensure_ascii=False).encode("utf-8"),
+                               data=json.dumps(new, ensure_ascii=False).encode("utf-8"),
                                headers={"Content-Type": "application/json"}, timeout=60)
             except Exception as e:
                 print(f"кэш индекса не сохранён: {e}")
