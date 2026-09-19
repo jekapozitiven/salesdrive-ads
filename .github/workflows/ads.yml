@@ -38,6 +38,12 @@ jobs:
           # id статусов SalesDrive, которые = апрув (через запятую), напр. "6,9,11":
           APRUV_STATUS: ${{ secrets.APRUV_STATUS }}
           FIREBASE_DB_URL: ${{ secrets.FIREBASE_DB_URL }}
+          # для майстер-списку категорій по магазинах:
+          TOKEN_BLACKSTREET: ${{ secrets.TOKEN_BLACKSTREET }}
+          TOKEN_BONNA: ${{ secrets.TOKEN_BONNA }}
+          HOROSHOP_DOMAIN: ${{ secrets.HOROSHOP_DOMAIN }}
+          HOROSHOP_LOGIN: ${{ secrets.HOROSHOP_LOGIN }}
+          HOROSHOP_PASSWORD: ${{ secrets.HOROSHOP_PASSWORD }}
           # маржа/дроп из MyDrop:
           MYDROP_API_KEY: ${{ secrets.MYDROP_API_KEY }}
           SD_MYDROP: ${{ github.event.inputs.mydrop }}
