@@ -640,27 +640,34 @@ def _horoshop_categories(cap=4000):
     login = os.environ.get("HOROSHOP_LOGIN", "").strip()
     pw = os.environ.get("HOROSHOP_PASSWORD", "").strip()
     if not (domain and login and pw):
+        print(f"Horoshop: пусті секрети (domain={bool(domain)}, login={bool(login)}, pass={bool(pw)})")
         return []
     try:
         r = requests.post(f"https://{domain}/api/auth/", json={"login": login, "password": pw}, timeout=30)
         j = r.json()
         tok = (j.get("response") or {}).get("token") if isinstance(j.get("response"), dict) else None
-        tok = tok or j.get("token")
+        tok = tok or j.get("token") or ((j.get("data") or {}).get("token") if isinstance(j.get("data"), dict) else None)
     except Exception as e:
-        print(f"Horoshop auth: {e}"); return []
+        print(f"Horoshop auth error: {e}"); return []
     if not tok:
+        print(f"Horoshop {domain}: токен НЕ отримано. HTTP {r.status_code}, відповідь: {str(j)[:250]}")
         return []
-    cats, offset = set(), 0
+    print(f"Horoshop {domain}: авторизація ок")
+    cats, offset, first = set(), 0, True
     while offset < cap:
         try:
             r = requests.post(f"https://{domain}/api/products/get/", json={"token": tok, "limit": 500, "offset": offset}, timeout=60)
-        except Exception:
-            break
+        except Exception as e:
+            print(f"Horoshop products error: {e}"); break
         if r.status_code != 200:
-            break
+            print(f"Horoshop products HTTP {r.status_code}: {r.text[:200]}"); break
         j = r.json()
         prods = (j.get("response") or {}).get("products") if isinstance(j.get("response"), dict) else None
-        prods = prods or j.get("products") or []
+        prods = prods or j.get("products") or (j.get("data") if isinstance(j.get("data"), list) else None) or []
+        if first:
+            print(f"Horoshop: товарів на стор.={len(prods)}, ключі відповіді={list(j.keys()) if isinstance(j,dict) else type(j).__name__}, "
+                  f"parent прикладу={prods[0].get('parent') if prods else '-'}")
+            first = False
         if not prods:
             break
         for p in prods:
