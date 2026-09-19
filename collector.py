@@ -665,8 +665,10 @@ def _horoshop_categories(cap=4000):
         prods = (j.get("response") or {}).get("products") if isinstance(j.get("response"), dict) else None
         prods = prods or j.get("products") or (j.get("data") if isinstance(j.get("data"), list) else None) or []
         if first:
-            print(f"Horoshop: товарів на стор.={len(prods)}, ключі відповіді={list(j.keys()) if isinstance(j,dict) else type(j).__name__}, "
-                  f"parent прикладу={prods[0].get('parent') if prods else '-'}")
+            resp = j.get("response") if isinstance(j, dict) else None
+            print(f"Horoshop: товарів={len(prods)}; ключі response="
+                  f"{list(resp.keys()) if isinstance(resp,dict) else type(resp).__name__}")
+            print("Horoshop RAW: " + json.dumps(j, ensure_ascii=False)[:500])
             first = False
         if not prods:
             break
