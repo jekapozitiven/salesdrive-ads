@@ -606,13 +606,11 @@ def mydrop_probe(days):
     print(f"\nДЖОЙН: телефон {m_ph}/{tot}; телефон+артикул {m_phsku}/{tot}")
 
 
-def fetch_catlist():
-    """Повний перелік категорій каталогу з Prom (groups/list) за токеном Black-street.
-    Товари розходяться з Black-street на інші магазини, тож це майстер-список для всіх."""
-    tok = os.environ.get("TOKEN_BLACKSTREET", "").strip()
-    if not tok:
+def _prom_groups(token):
+    """Категорії з Prom (groups/list) за токеном магазину."""
+    if not token:
         return []
-    cats, url, headers, last = {}, "https://my.prom.ua/api/v1/groups/list", {"Authorization": "Bearer " + tok}, None
+    cats, url, headers, last = {}, "https://my.prom.ua/api/v1/groups/list", {"Authorization": "Bearer " + token}, None
     for _ in range(60):
         params = {"limit": 100}
         if last:
@@ -634,6 +632,71 @@ def fetch_catlist():
         last = nl
         time.sleep(0.2)
     return sorted(cats.keys())
+
+
+def _horoshop_categories(cap=4000):
+    """Категорії Blink з Horoshop (беремо з поля parent товарів)."""
+    domain = os.environ.get("HOROSHOP_DOMAIN", "").strip().replace("https://", "").replace("http://", "").strip("/")
+    login = os.environ.get("HOROSHOP_LOGIN", "").strip()
+    pw = os.environ.get("HOROSHOP_PASSWORD", "").strip()
+    if not (domain and login and pw):
+        return []
+    try:
+        r = requests.post(f"https://{domain}/api/auth/", json={"login": login, "password": pw}, timeout=30)
+        j = r.json()
+        tok = (j.get("response") or {}).get("token") if isinstance(j.get("response"), dict) else None
+        tok = tok or j.get("token")
+    except Exception as e:
+        print(f"Horoshop auth: {e}"); return []
+    if not tok:
+        return []
+    cats, offset = set(), 0
+    while offset < cap:
+        try:
+            r = requests.post(f"https://{domain}/api/products/get/", json={"token": tok, "limit": 500, "offset": offset}, timeout=60)
+        except Exception:
+            break
+        if r.status_code != 200:
+            break
+        j = r.json()
+        prods = (j.get("response") or {}).get("products") if isinstance(j.get("response"), dict) else None
+        prods = prods or j.get("products") or []
+        if not prods:
+            break
+        for p in prods:
+            c = p.get("parent")
+            if isinstance(c, dict):
+                c = c.get("title") or c.get("name")
+            if isinstance(c, list):
+                c = c[-1] if c else None
+            if isinstance(c, str) and ("\\" in c or "/" in c):
+                c = re.split(r"[\\/]", c)[-1].strip()
+            if c:
+                cats.add(str(c).strip())
+        offset += len(prods)
+        if len(prods) < 500:
+            break
+        time.sleep(0.3)
+    return sorted(cats)
+
+
+def write_catlists():
+    """Майстер-список категорій ПО КОЖНОМУ магазину -> Firebase shop-reports/ads-catlist."""
+    out = {}
+    bs = _prom_groups(os.environ.get("TOKEN_BLACKSTREET", "").strip())
+    if bs:
+        out["Сайт-Black-street"] = bs
+    bn = _prom_groups(os.environ.get("TOKEN_BONNA", "").strip())
+    if bn:
+        out["Сайт-Bonna-shop"] = bn
+    bl = _horoshop_categories()
+    if bl:
+        out["Хор-Blink"] = bl
+    if out and FIREBASE_DB_URL:
+        requests.patch(f"{FIREBASE_DB_URL}/shop-reports/ads-catlist.json",
+                       data=json.dumps(out, ensure_ascii=False).encode("utf-8"),
+                       headers={"Content-Type": "application/json"}, timeout=60)
+    print("Майстер-список категорій: " + ", ".join(f"{k.split('-')[-1]}={len(v)}" for k, v in out.items()))
 
 
 def main():
@@ -665,14 +728,9 @@ def main():
 
     agg = aggregate(orders, mbe)
 
-    # мастер-список ВСЕХ категорий каталога (для привязки навіть без замовлень)
+    # мастер-список категорий ПО КАЖДОМУ магазину (для привязки навіть без замовлень)
     try:
-        cl = fetch_catlist()
-        if cl and FIREBASE_DB_URL:
-            requests.put(f"{FIREBASE_DB_URL}/shop-reports/ads-catlist.json",
-                         data=json.dumps(cl, ensure_ascii=False).encode("utf-8"),
-                         headers={"Content-Type": "application/json"}, timeout=40)
-        print(f"Майстер-список категорій: {len(cl)}")
+        write_catlists()
     except Exception as e:
         print(f"catlist: {e}")
 
