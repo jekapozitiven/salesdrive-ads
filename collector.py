@@ -606,6 +606,36 @@ def mydrop_probe(days):
     print(f"\nДЖОЙН: телефон {m_ph}/{tot}; телефон+артикул {m_phsku}/{tot}")
 
 
+def fetch_catlist():
+    """Повний перелік категорій каталогу з Prom (groups/list) за токеном Black-street.
+    Товари розходяться з Black-street на інші магазини, тож це майстер-список для всіх."""
+    tok = os.environ.get("TOKEN_BLACKSTREET", "").strip()
+    if not tok:
+        return []
+    cats, url, headers, last = {}, "https://my.prom.ua/api/v1/groups/list", {"Authorization": "Bearer " + tok}, None
+    for _ in range(60):
+        params = {"limit": 100}
+        if last:
+            params["last_id"] = last
+        r = requests.get(url, headers=headers, params=params, timeout=40)
+        if r.status_code != 200:
+            print(f"Prom groups HTTP {r.status_code}: {r.text[:150]}")
+            break
+        groups = (r.json() or {}).get("groups") or (r.json() or {}).get("data") or []
+        if not groups:
+            break
+        for g in groups:
+            nm = ((g.get("name_multilang") or {}).get("uk")) or g.get("name")
+            if nm and str(nm).strip():
+                cats[str(nm).strip()] = 1
+        nl = max((g.get("id") or 0) for g in groups)
+        if nl == last or len(groups) < 100:
+            break
+        last = nl
+        time.sleep(0.2)
+    return sorted(cats.keys())
+
+
 def main():
     if os.environ.get("SD_MYDROP", "").strip() in ("1", "true", "yes"):
         mydrop_probe(DAYS)
@@ -634,6 +664,17 @@ def main():
         print(f"Маржа сматчена: {cov}/{len(site)} сайтовых заказов")
 
     agg = aggregate(orders, mbe)
+
+    # мастер-список ВСЕХ категорий каталога (для привязки навіть без замовлень)
+    try:
+        cl = fetch_catlist()
+        if cl and FIREBASE_DB_URL:
+            requests.put(f"{FIREBASE_DB_URL}/shop-reports/ads-catlist.json",
+                         data=json.dumps(cl, ensure_ascii=False).encode("utf-8"),
+                         headers={"Content-Type": "application/json"}, timeout=40)
+        print(f"Майстер-список категорій: {len(cl)}")
+    except Exception as e:
+        print(f"catlist: {e}")
 
     # сводка в лог (проверка перед записью)
     print("\n=== СВОДКА ПО КАМПАНИЯМ ===")
