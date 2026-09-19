@@ -146,10 +146,20 @@ def fetch_page(page, date_from):
         "filter[orderTime][from]": date_from,
         "filter[statusId]": "__ALL__",
     }
-    r = requests.get(_base() + "/api/order/list/", params=params,
-                     headers={"Form-Api-Key": SD_KEY}, timeout=TIMEOUT)
-    if r.status_code != 200:
+    for attempt in range(4):
+        r = requests.get(_base() + "/api/order/list/", params=params,
+                         headers={"Form-Api-Key": SD_KEY}, timeout=TIMEOUT)
+        if r.status_code == 200:
+            break
+        if r.status_code in (429, 500, 502, 503, 504):
+            wait = 15 * (attempt + 1)
+            print(f"SalesDrive {r.status_code} (ліміт?) — чекаю {wait}s, спроба {attempt + 1}/4")
+            time.sleep(wait)
+            continue
         raise SystemExit(f"SalesDrive HTTP {r.status_code}: {r.text[:400]}")
+    else:
+        print("SalesDrive: ліміт не відпустив — пропускаю прогін (наступний за розкладом добере).")
+        sys.exit(0)   # м'який вихід, джоб не червоний
     try:
         return r.json()
     except Exception:
@@ -673,7 +683,12 @@ def _horoshop_categories(cap=4000):
         if first:
             print(f"Horoshop export: товарів={len(prods)}")
             if prods:
-                print("Horoshop приклад товару: " + json.dumps(prods[0], ensure_ascii=False)[:700])
+                print("Horoshop ПОЛЯ товару: " + ", ".join(sorted(str(k) for k in prods[0].keys())))
+                # покажемо поля, схожі на категорію
+                for k, v in prods[0].items():
+                    kl = str(k).lower()
+                    if any(w in kl for w in ("categ", "parent", "page", "razdel", "section", "group")):
+                        print(f"  {k} = {json.dumps(v, ensure_ascii=False)[:160]}")
             else:
                 print("Horoshop RAW: " + json.dumps(j, ensure_ascii=False)[:400])
             first = False
