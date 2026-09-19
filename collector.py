@@ -656,31 +656,40 @@ def _horoshop_categories(cap=4000):
     cats, offset, first = set(), 0, True
     while offset < cap:
         try:
-            r = requests.post(f"https://{domain}/api/products/get/", json={"token": tok, "limit": 500, "offset": offset}, timeout=60)
+            r = requests.post(f"https://{domain}/api/catalog/export/",
+                              json={"token": tok, "limit": 500, "offset": offset}, timeout=60)
         except Exception as e:
-            print(f"Horoshop products error: {e}"); break
+            print(f"Horoshop export error: {e}"); break
         if r.status_code != 200:
-            print(f"Horoshop products HTTP {r.status_code}: {r.text[:200]}"); break
+            print(f"Horoshop export HTTP {r.status_code}: {r.text[:200]}"); break
         j = r.json()
-        prods = (j.get("response") or {}).get("products") if isinstance(j.get("response"), dict) else None
-        prods = prods or j.get("products") or (j.get("data") if isinstance(j.get("data"), list) else None) or []
+        resp = j.get("response") if isinstance(j.get("response"), (dict, list)) else j
+        if isinstance(resp, dict):
+            prods = resp.get("products") or resp.get("items") or []
+        elif isinstance(resp, list):
+            prods = resp
+        else:
+            prods = []
         if first:
-            resp = j.get("response") if isinstance(j, dict) else None
-            print(f"Horoshop: товарів={len(prods)}; ключі response="
-                  f"{list(resp.keys()) if isinstance(resp,dict) else type(resp).__name__}")
-            print("Horoshop RAW: " + json.dumps(j, ensure_ascii=False)[:500])
+            print(f"Horoshop export: товарів={len(prods)}")
+            if prods:
+                print("Horoshop приклад товару: " + json.dumps(prods[0], ensure_ascii=False)[:700])
+            else:
+                print("Horoshop RAW: " + json.dumps(j, ensure_ascii=False)[:400])
             first = False
         if not prods:
             break
         for p in prods:
-            c = p.get("parent")
+            # категорія Horoshop: пробуємо кілька полів (уточню за прикладом товару)
+            c = (p.get("category") or p.get("parent_category") or p.get("group") or
+                 p.get("category_name") or p.get("categoryName") or p.get("parent"))
             if isinstance(c, dict):
                 c = c.get("title") or c.get("name")
             if isinstance(c, list):
                 c = c[-1] if c else None
             if isinstance(c, str) and ("\\" in c or "/" in c):
                 c = re.split(r"[\\/]", c)[-1].strip()
-            if c:
+            if c and not str(c).isdigit():
                 cats.add(str(c).strip())
         offset += len(prods)
         if len(prods) < 500:
