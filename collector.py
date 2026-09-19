@@ -682,30 +682,18 @@ def _horoshop_categories(cap=4000):
             prods = []
         if first:
             print(f"Horoshop export: товарів={len(prods)}")
-            if prods:
-                print("Horoshop ПОЛЯ товару: " + ", ".join(sorted(str(k) for k in prods[0].keys())))
-                # покажемо поля, схожі на категорію
-                for k, v in prods[0].items():
-                    kl = str(k).lower()
-                    if any(w in kl for w in ("categ", "parent", "page", "razdel", "section", "group")):
-                        print(f"  {k} = {json.dumps(v, ensure_ascii=False)[:160]}")
-            else:
-                print("Horoshop RAW: " + json.dumps(j, ensure_ascii=False)[:400])
             first = False
         if not prods:
             break
         for p in prods:
-            # категорія Horoshop: пробуємо кілька полів (уточню за прикладом товару)
-            c = (p.get("category") or p.get("parent_category") or p.get("group") or
-                 p.get("category_name") or p.get("categoryName") or p.get("parent"))
+            # категорія Blink: поле parent = {"id":.., "value":"Чоловічий одяг/Футболки"} -> леаф
+            c = p.get("parent")
             if isinstance(c, dict):
-                c = c.get("title") or c.get("name")
-            if isinstance(c, list):
-                c = c[-1] if c else None
-            if isinstance(c, str) and ("\\" in c or "/" in c):
-                c = re.split(r"[\\/]", c)[-1].strip()
+                c = c.get("value") or c.get("title") or c.get("name")
+            if isinstance(c, str):
+                c = re.split(r"[\\/]", c)[-1].strip()   # останній сегмент шляху
             if c and not str(c).isdigit():
-                cats.add(str(c).strip())
+                cats.add(str(c))
         offset += len(prods)
         if len(prods) < 500:
             break
