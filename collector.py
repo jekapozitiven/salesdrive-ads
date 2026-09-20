@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 BBB CLUB — сборщик рекламной статистики по кампаниям (SalesDrive → MyDrop → Firebase).
@@ -48,24 +49,33 @@ WORKER_URL = os.environ.get(
 
 _cat_cache = {}
 
+# магазин заказа -> ключ магазина в воркере «Товары» (чтобы категория тянулась
+# СТРОГО из каталога этого магазина, а не из склеенной межмагазинной карточки).
+SHOP_TO_STORE = {"Black-street": "blackstreet", "Bonna-shop": "bonna", "Blink": "blink"}
 
-def category_of(sku):
-    """Артикул -> категория через /lookup воркера «Товары». С кэшем по артикулу."""
+
+def category_of(sku, store=None):
+    """Артикул -> категория через /lookup воркера «Товары». С кэшем по (магазин, артикул).
+    store: ключ магазина (blackstreet/bonna/blink) — категория берётся именно этого магазина."""
     key = (sku or "").strip()
     if not key:
         return None
-    if key in _cat_cache:
-        return _cat_cache[key]
+    ck = f"{store or ''}|{key}"
+    if ck in _cat_cache:
+        return _cat_cache[ck]
     cat = None
     try:
-        r = requests.post(WORKER_URL + "/lookup", json={"article": key}, timeout=20)
+        body = {"article": key}
+        if store:
+            body["store"] = store
+        r = requests.post(WORKER_URL + "/lookup", json=body, timeout=20)
         if r.status_code == 200:
             j = r.json()
             if j.get("found"):
                 cat = (j.get("product") or {}).get("category") or None
     except Exception as e:
         print(f"  lookup error {key!r}: {e}")
-    _cat_cache[key] = cat
+    _cat_cache[ck] = cat
     return cat
 
 
@@ -355,10 +365,12 @@ def _num(v):
 
 
 def order_categories(e):
-    """Список уникальных категорий по артикулам основного товара заказа."""
+    """Список уникальных категорий по артикулам основного товара заказа.
+    Категория берётся из каталога ИМЕННО магазина заказа (store)."""
+    store = SHOP_TO_STORE.get(e["shop"])
     cats = []
     for sku in e["skus"]:
-        c = category_of(sku)
+        c = category_of(sku, store)
         if c and c not in cats:
             cats.append(c)
     return cats
@@ -366,9 +378,12 @@ def order_categories(e):
 
 def aggregate(orders, margin_by_ext=None):
     """Агрегаты по источник -> день -> категория(кампания). Смешанные -> отдельная корзина.
-    margin_by_ext: {внешний_номер: маржа} из MyDrop (по externalId заказа)."""
+    margin_by_ext: {внешний_номер: маржа} из MyDrop (по externalId заказа).
+    Возвращает (agg, articles), где articles: источник -> катКлюч -> {артикул: кол-во}
+    (для раскрытия категории до списка артикулов во вкладке «Реклама»)."""
     mbe = margin_by_ext or {}
     agg = {}
+    articles = {}
     for x in orders:
         e = extract(x)
         if e["source"] not in WANTED_SOURCES:
@@ -383,7 +398,8 @@ def aggregate(orders, margin_by_ext=None):
             catkey, catname = fbkey(cats[0]), cats[0]
         else:
             catkey, catname = "_no_cat", "(без категорії)"
-        cell = agg.setdefault(fbkey(e["source"]), {}).setdefault(day, {}).setdefault(catkey, {
+        srckey = fbkey(e["source"])
+        cell = agg.setdefault(srckey, {}).setdefault(day, {}).setdefault(catkey, {
             "cat": catname, "leads": 0, "approved": 0, "sum": 0.0,
             "upsCount": 0, "upsSum": 0.0, "margin": 0.0, "extIds": [],
         })
@@ -397,7 +413,15 @@ def aggregate(orders, margin_by_ext=None):
         cell["margin"] += mbe.get(str(e["externalId"]), 0.0)
         if e["externalId"] and len(cell["extIds"]) < 500:
             cell["extIds"].append(str(e["externalId"]))
-    return agg
+        # артикулы этой категории (по магазину) — для раскрытия в приложении
+        abucket = articles.setdefault(srckey, {}).setdefault(catkey, {})
+        for sku in e["skus"]:
+            s = (sku or "").strip()
+            if not s:
+                continue
+            if s in abucket or len(abucket) < 800:
+                abucket[s] = abucket.get(s, 0) + 1
+    return agg, articles
 
 
 def push_ads_firebase(agg):
@@ -409,6 +433,16 @@ def push_ads_firebase(agg):
     r = requests.put(url, data=json.dumps(agg, ensure_ascii=False).encode("utf-8"),
                      headers={"Content-Type": "application/json"}, timeout=60)
     print(f"Firebase ads: HTTP {r.status_code}, источников={len(agg)}")
+
+
+def push_articles_firebase(articles):
+    """PUT списка артикулов по категориям в shop-reports/ads-articles (для раскрытия категории)."""
+    if not FIREBASE_DB_URL:
+        return
+    url = f"{FIREBASE_DB_URL}/shop-reports/ads-articles.json"
+    r = requests.put(url, data=json.dumps(articles, ensure_ascii=False).encode("utf-8"),
+                     headers={"Content-Type": "application/json"}, timeout=60)
+    print(f"Firebase ads-articles: HTTP {r.status_code}, источников={len(articles)}")
 
 
 MYDROP_KEY = os.environ.get("MYDROP_API_KEY", "").strip()
@@ -749,7 +783,7 @@ def main():
         cov = sum(1 for e in site if str(e["externalId"]) in mbe)
         print(f"Маржа сматчена: {cov}/{len(site)} сайтовых заказов")
 
-    agg = aggregate(orders, mbe)
+    agg, articles = aggregate(orders, mbe)
 
     # мастер-список каталога больше НЕ тянем: категории берём из рекламируемых
     # product_type Google Ads (узел ads-google-cat, пишется Google-скриптом).
@@ -772,6 +806,7 @@ def main():
         print("\n(!) APRUV_STATUS не задан — 'апрув' везде 0. Добавь секрет APRUV_STATUS "
               "со списком id статусов-апрув через запятую.")
     push_ads_firebase(agg)
+    push_articles_firebase(articles)
 
 
 if __name__ == "__main__":
