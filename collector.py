@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 BBB CLUB — сборщик рекламной статистики по кампаниям (SalesDrive → MyDrop → Firebase).
@@ -436,13 +435,21 @@ def push_ads_firebase(agg):
 
 
 def push_articles_firebase(articles):
-    """PUT списка артикулов по категориям в shop-reports/ads-articles (для раскрытия категории)."""
+    """PUT списка артикулов по категориям в shop-reports/ads-articles (для раскрытия категории).
+    ВАЖНО: артикулы содержат / . ( ) — их НЕЛЬЗЯ использовать как ключи Firebase.
+    Поэтому пишем СПИСКОМ пар [артикул, кол-во] (по убыванию кол-ва)."""
     if not FIREBASE_DB_URL:
         return
+    out = {}
+    for src, cats in (articles or {}).items():
+        o = {}
+        for ck, d in cats.items():
+            o[ck] = [[sku, n] for sku, n in sorted(d.items(), key=lambda kv: -kv[1])]
+        out[src] = o
     url = f"{FIREBASE_DB_URL}/shop-reports/ads-articles.json"
-    r = requests.put(url, data=json.dumps(articles, ensure_ascii=False).encode("utf-8"),
+    r = requests.put(url, data=json.dumps(out, ensure_ascii=False).encode("utf-8"),
                      headers={"Content-Type": "application/json"}, timeout=60)
-    print(f"Firebase ads-articles: HTTP {r.status_code}, источников={len(articles)}")
+    print(f"Firebase ads-articles: HTTP {r.status_code}, источников={len(out)}")
 
 
 MYDROP_KEY = os.environ.get("MYDROP_API_KEY", "").strip()
