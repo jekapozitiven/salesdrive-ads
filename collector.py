@@ -644,7 +644,7 @@ def _prom_groups(token):
     return sorted(cats.keys())
 
 
-def _horoshop_categories(cap=4000):
+def _horoshop_categories(cap=12000):
     """Категорії Blink з Horoshop (беремо з поля parent товарів)."""
     domain = os.environ.get("HOROSHOP_DOMAIN", "").strip().replace("https://", "").replace("http://", "").strip("/")
     login = os.environ.get("HOROSHOP_LOGIN", "").strip()
@@ -686,14 +686,16 @@ def _horoshop_categories(cap=4000):
         if not prods:
             break
         for p in prods:
-            # категорія Blink: поле parent = {"id":.., "value":"Чоловічий одяг/Футболки"} -> леаф
+            # категорія Blink: parent = {"id":.., "value":"Чоловічий одяг/Футболки"}
+            # додаємо ВСІ рівні шляху (і батьківські групи, і підгрупи)
             c = p.get("parent")
             if isinstance(c, dict):
                 c = c.get("value") or c.get("title") or c.get("name")
             if isinstance(c, str):
-                c = re.split(r"[\\/]", c)[-1].strip()   # останній сегмент шляху
-            if c and not str(c).isdigit():
-                cats.add(str(c))
+                for seg in re.split(r"[\\/]", c):
+                    seg = seg.strip()
+                    if seg and not seg.isdigit():
+                        cats.add(seg)
         offset += len(prods)
         if len(prods) < 500:
             break
@@ -749,11 +751,8 @@ def main():
 
     agg = aggregate(orders, mbe)
 
-    # мастер-список категорий ПО КАЖДОМУ магазину (для привязки навіть без замовлень)
-    try:
-        write_catlists()
-    except Exception as e:
-        print(f"catlist: {e}")
+    # мастер-список каталога больше НЕ тянем: категории берём из рекламируемых
+    # product_type Google Ads (узел ads-google-cat, пишется Google-скриптом).
 
     # сводка в лог (проверка перед записью)
     print("\n=== СВОДКА ПО КАМПАНИЯМ ===")
