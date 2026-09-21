@@ -495,6 +495,73 @@ def build_ord(orders, mbe=None):
     return out
 
 
+# --- телефонные заказы с сайта: из MyDrop по примечанию оператора ---
+MD_SHOP_FROM_NOTE = [
+    (re.compile(r"блек|блэк|black", re.I), "Сайт-Black-street", "blackstreet"),
+    (re.compile(r"бонна|bonna", re.I),     "Сайт-Bonna-shop",   "bonna"),
+    (re.compile(r"блін?к|блин?к|blink", re.I), "Хор-Blink",     "blink"),
+]
+ARTICLE_RE = re.compile(r"[A-Za-zА-Яа-яЇїІіЄєҐґ][A-Za-zА-Яа-яЇїІіЄєҐґ0-9.]*-[A-Za-z0-9./]+")
+MD_APPROVE_WORDS = ("підтвер", "подтвер", "продаж", "прода", "відправл", "отправл",
+                    "виконан", "выполн", "доставл", "видан", "выдан", "оплач")
+
+
+def _md_approved(m):
+    t = str((m.get("orderStatus") or {}).get("title") or "").lower()
+    return 1 if any(w in t for w in MD_APPROVE_WORDS) else 0
+
+
+def build_phone_ord(md_orders):
+    """Телефонные заказы с сайта: MyDrop-заказы, где в примечании (description) есть
+    «с сайта <магазин>». Магазин из примечания, категория из артикула (в примечании
+    или из товара), дроп/маржа/сумма из заказа MyDrop. Ключ oid = md<id> (не двоит)."""
+    out = {}
+    for m in md_orders:
+        note = str(m.get("description") or "")
+        if not re.search(r"с\s*сайт", note, re.I):
+            continue
+        shop = None
+        for rx, src, store in MD_SHOP_FROM_NOTE:
+            if rx.search(note):
+                shop = (src, store); break
+        if not shop:
+            continue
+        src, store = shop
+        day = str(m.get("dateTime") or m.get("date") or "")[:10]
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", day):
+            continue
+        oid = "md" + str(m.get("id") or "")
+        if oid == "md":
+            continue
+        total = _num(m.get("total"))
+        prods = m.get("products") or []
+        arts = ARTICLE_RE.findall(note)
+        if not arts:
+            arts = [((p.get("product") or {}).get("sku") or p.get("sku") or "") for p in prods]
+        cat, item = None, None
+        for a in arts:
+            a = (a or "").strip()
+            if not a:
+                continue
+            p = product_of(a, store)
+            nm = p["name"] or (prods and (prods[0].get("product") or {}).get("title")) or a
+            if not item:
+                item = {"sku": a, "name": nm, "img": p["img"] or "", "href": "", "price": total}
+            if p["category"]:
+                cat = p["category"]
+                item = {"sku": a, "name": nm, "img": p["img"] or "", "href": "", "price": total}
+                break
+        margin = _num(m.get("realMargin"))
+        drop = _num(m.get("dropPrice")) or (total - margin if margin else 0.0)
+        out.setdefault(fbkey(src), {}).setdefault(day, {})[oid] = {
+            "catKey": fbkey(cat) if cat else "_no_cat", "catName": cat or "(без категорії)",
+            "approved": _md_approved(m), "sum": total, "upsSum": 0.0, "upsCount": 0,
+            "margin": margin, "drop": round(drop, 2),
+            "items": [item] if item else [], "ext": str(m.get("id") or ""), "phone": 1,
+        }
+    return out
+
+
 def push_ord_firebase(ordtree):
     """PATCH пер-заказной детализации ПО ДНЯМ в ads-ord/<src>/<day> — мерж (не стираем свежие из вебхука),
     история навсегда (старые дни не трогаем)."""
@@ -910,6 +977,7 @@ def main():
 
     # маржа из MyDrop по внешнему номеру (если задан ключ)
     mbe = {}
+    md = []
     if MYDROP_KEY:
         md = mydrop_fetch(DAYS)
         print(f"MyDrop: заказов {len(md)}")
@@ -945,6 +1013,15 @@ def main():
     # ads собираем ИЗ ads-ord, чтобы учитывались и телефонные заказы из MyDrop.
     try:
         ordtree = build_ord(orders, mbe)
+        # телефонные заказы с сайта из MyDrop (по примечанию) — в ту же ветку
+        phone_tree = build_phone_ord(md)
+        nph = 0
+        for src, days in phone_tree.items():
+            for day, ords in days.items():
+                ordtree.setdefault(src, {}).setdefault(day, {}).update(ords)
+                nph += len(ords)
+        if nph:
+            print(f"Телефонные с сайта (MyDrop, по примечанию): {nph}")
         push_ord_firebase(ordtree)
         reaggregate_ads_from_ord(ordtree)
     except Exception as e:
