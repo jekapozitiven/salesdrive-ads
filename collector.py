@@ -476,7 +476,7 @@ def build_ord(orders, mbe=None):
             p = product_of(it["sku"], store)
             if p["category"] and p["category"] not in cats:
                 cats.append(p["category"])
-            items.append({"sku": it["sku"] or "", "name": p["name"] or it["name"] or "",
+            items.append({"sku": it["sku"] or "", "name": it["name"] or p["name"] or it["sku"] or "",
                           "img": p["img"] or "", "href": it["href"] or "", "price": it["price"]})
         if len(cats) > 1:
             catkey, catname = MIXED_KEY, "Потребує розподілу (кілька категорій)"
