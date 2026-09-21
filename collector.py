@@ -54,16 +54,16 @@ _cat_cache = {}
 SHOP_TO_STORE = {"Black-street": "blackstreet", "Bonna-shop": "bonna", "Blink": "blink"}
 
 
-def category_of(sku, store=None):
-    """Артикул -> категория через /lookup воркера «Товары». С кэшем по (магазин, артикул).
-    store: ключ магазина (blackstreet/bonna/blink) — категория берётся именно этого магазина."""
+def product_of(sku, store=None):
+    """Артикул -> карточка товара из «Товары» (/lookup). Кэш по (магазин, артикул).
+    Возвращает {category, name, img} (или None-поля, если не найдено)."""
     key = (sku or "").strip()
     if not key:
-        return None
+        return {"category": None, "name": "", "img": ""}
     ck = f"{store or ''}|{key}"
     if ck in _cat_cache:
         return _cat_cache[ck]
-    cat = None
+    out = {"category": None, "name": "", "img": ""}
     try:
         body = {"article": key}
         if store:
@@ -72,11 +72,23 @@ def category_of(sku, store=None):
         if r.status_code == 200:
             j = r.json()
             if j.get("found"):
-                cat = (j.get("product") or {}).get("category") or None
+                p = j.get("product") or {}
+                imgs = p.get("images") or []
+                img = ""
+                if imgs:
+                    first = imgs[0]
+                    img = first.get("url") if isinstance(first, dict) else str(first)
+                out = {"category": p.get("category") or None,
+                       "name": p.get("name") or "", "img": img or ""}
     except Exception as e:
         print(f"  lookup error {key!r}: {e}")
-    _cat_cache[ck] = cat
-    return cat
+    _cat_cache[ck] = out
+    return out
+
+
+def category_of(sku, store=None):
+    """Артикул -> категория (обёртка над product_of)."""
+    return product_of(sku, store)["category"]
 
 
 def _dom(h):
@@ -136,6 +148,9 @@ def extract(o):
         "expenses": o.get("expensesAmount"),
         "source": site_source(o),
         "skus": [p.get("sku") for p in main],
+        "mainItems": [{"sku": p.get("sku"), "price": amt(p),
+                       "href": p.get("href") or "", "name": p.get("text") or p.get("name") or ""}
+                      for p in main],
         "mainSum": sum(amt(p) for p in main),
         "upsells": [{"name": p.get("text"), "price": p.get("price")} for p in ups],
         "upsellSum": sum(amt(p) for p in ups),
@@ -425,67 +440,74 @@ def aggregate(orders, margin_by_ext=None):
 
 
 def push_ads_firebase(agg):
-    """PUT агрегатов в shop-reports/ads (только эта ветка)."""
+    """PUT агрегатов ПО ДНЯМ в shop-reports/ads/<src>/<day> — история накапливается (старое не стираем)."""
     if not FIREBASE_DB_URL:
         print("FIREBASE_DB_URL пуст — агрегаты не записаны (только показ).")
         return
-    url = f"{FIREBASE_DB_URL}/shop-reports/ads.json"
-    r = requests.put(url, data=json.dumps(agg, ensure_ascii=False).encode("utf-8"),
-                     headers={"Content-Type": "application/json"}, timeout=60)
-    print(f"Firebase ads: HTTP {r.status_code}, источников={len(agg)}")
+    n = 0
+    for src, days in agg.items():
+        for day, cells in days.items():
+            url = f"{FIREBASE_DB_URL}/shop-reports/ads/{quote(src, safe='')}/{day}.json"
+            requests.put(url, data=json.dumps(cells, ensure_ascii=False).encode("utf-8"),
+                         headers={"Content-Type": "application/json"}, timeout=60)
+            n += 1
+    print(f"Firebase ads: записано дней {n} по {len(agg)} источникам")
 
 
-def build_live(orders, mbe=None, recent=2):
-    """Пер-заказные записи за последние `recent` дней — «подсев» для мгновенной вкладки
-    (вебхук держит их свежими, коллектор делает полными и добавляет маржу).
-    Возвращает (live, complete_days). live: srckey -> day -> oid -> {...}."""
+def build_ord(orders, mbe=None):
+    """Пер-заказная детализация (навсегда): srckey -> day -> oid -> запись с товарами.
+    Запись: {catKey,catName,approved,sum,upsSum,upsCount,margin,drop,items,ext}.
+    items: [{sku,name,img,href,price}]. drop = продажна − маржа (по факту MyDrop)."""
     mbe = mbe or {}
-    today = dt.date.today()
-    days_ok = {(today - dt.timedelta(days=i)).isoformat() for i in range(recent)}
-    live = {}
+    out = {}
     for x in orders:
         e = extract(x)
         if e["source"] not in WANTED_SOURCES:
             continue
         day = e["date"]
-        if day not in days_ok:
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", day or ""):
             continue
         oid = str(x.get("id") or "")
         if not oid:
             continue
-        cats = order_categories(e)
+        store = SHOP_TO_STORE.get(e["shop"])
+        cats, items = [], []
+        for it in e["mainItems"]:
+            p = product_of(it["sku"], store)
+            if p["category"] and p["category"] not in cats:
+                cats.append(p["category"])
+            items.append({"sku": it["sku"] or "", "name": p["name"] or it["name"] or "",
+                          "img": p["img"] or "", "href": it["href"] or "", "price": it["price"]})
         if len(cats) > 1:
             catkey, catname = MIXED_KEY, "Потребує розподілу (кілька категорій)"
         elif cats:
             catkey, catname = fbkey(cats[0]), cats[0]
         else:
             catkey, catname = "_no_cat", "(без категорії)"
-        live.setdefault(fbkey(e["source"]), {}).setdefault(day, {})[oid] = {
+        margin = mbe.get(str(e["externalId"]), 0.0)
+        out.setdefault(fbkey(e["source"]), {}).setdefault(day, {})[oid] = {
             "catKey": catkey, "catName": catname,
             "approved": 1 if str(x.get("statusId")) in APRUV_STATUS else 0,
-            "sum": e["mainSum"], "upsSum": e["upsellSum"],
-            "upsCount": 1 if e["upsells"] else 0,
-            "margin": mbe.get(str(e["externalId"]), 0.0),
+            "sum": e["mainSum"], "upsSum": e["upsellSum"], "upsCount": 1 if e["upsells"] else 0,
+            "margin": margin, "drop": round((e["mainSum"] or 0) - margin, 2),
+            "items": items, "ext": str(e["externalId"] or ""),
         }
-    return live, sorted(days_ok)
+    return out
 
 
-def push_live_firebase(live, complete_days):
-    """PATCH пер-заказных записей в ads-live-ord (мерж — не стираем свежие из вебхука)
-    + список полных дней в ads-live-meta/completeDays."""
+def push_ord_firebase(ordtree):
+    """PATCH пер-заказной детализации ПО ДНЯМ в ads-ord/<src>/<day> — мерж (не стираем свежие из вебхука),
+    история навсегда (старые дни не трогаем)."""
     if not FIREBASE_DB_URL:
         return
     n = 0
-    for srckey, days in live.items():
+    for src, days in ordtree.items():
         for day, ords in days.items():
-            url = f"{FIREBASE_DB_URL}/shop-reports/ads-live-ord/{quote(srckey, safe='')}/{day}.json"
+            url = f"{FIREBASE_DB_URL}/shop-reports/ads-ord/{quote(src, safe='')}/{day}.json"
             requests.patch(url, data=json.dumps(ords, ensure_ascii=False).encode("utf-8"),
                            headers={"Content-Type": "application/json"}, timeout=60)
             n += len(ords)
-    requests.put(f"{FIREBASE_DB_URL}/shop-reports/ads-live-meta/completeDays.json",
-                 data=json.dumps(complete_days).encode("utf-8"),
-                 headers={"Content-Type": "application/json"}, timeout=30)
-    print(f"Firebase ads-live: заказов подсеяно {n}, полные дни {complete_days}")
+    print(f"Firebase ads-ord: заказов записано {n}")
 
 
 def push_articles_firebase(articles):
@@ -867,13 +889,12 @@ def main():
         print("\n(!) APRUV_STATUS не задан — 'апрув' везде 0. Добавь секрет APRUV_STATUS "
               "со списком id статусов-апрув через запятую.")
     push_ads_firebase(agg)
-    push_articles_firebase(articles)
-    # подсев мгновенной вкладки (последние 2 дня) — полнота + маржа
+    # поордерная детализация (товары, дроп, маржа) — постоянная история для раскрытия
     try:
-        live, complete_days = build_live(orders, mbe)
-        push_live_firebase(live, complete_days)
+        ordtree = build_ord(orders, mbe)
+        push_ord_firebase(ordtree)
     except Exception as e:
-        print(f"ads-live подсев: {e}")
+        print(f"ads-ord: {e}")
 
 
 if __name__ == "__main__":
