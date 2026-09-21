@@ -841,9 +841,20 @@ def mydrop_probe(days):
                 if re.search(r"источник|джерел|трафик|traffic|source|utm|канал", p, re.I):
                     srcfields.setdefault(p, set()).update(vals)
         srcfields = {k: sorted(v)[:30] for k, v in srcfields.items()}
+        # статистика маржи: продажна−дроп (валовая) против realMargin, наличие dropPrice
+        n_drop = s_total = s_drop = s_real = 0
+        for m in md:
+            t = _num(m.get("total")); dp = _num(m.get("dropPrice")); rm = _num(m.get("realMargin"))
+            if dp > 0:
+                n_drop += 1
+            s_total += t; s_drop += dp; s_real += rm
+        margin_stats = {"orders": len(md), "withDropPrice": n_drop,
+                        "sumTotal": round(s_total), "sumDrop": round(s_drop),
+                        "grossMargin_total_minus_drop": round(s_total - s_drop),
+                        "sumRealMargin": round(s_real)}
         dbg = {"at": dt.datetime.now().isoformat(), "count": len(md),
                "allKeys": sorted(str(k) for k in md[0].keys()),
-               "trafficFields": srcfields, "samples": md[:3]}
+               "trafficFields": srcfields, "marginStats": margin_stats, "samples": md[:3]}
         try:
             requests.put(f"{FIREBASE_DB_URL}/shop-reports/mydrop-debug.json",
                          data=json.dumps(dbg, ensure_ascii=False, default=str).encode("utf-8"),
