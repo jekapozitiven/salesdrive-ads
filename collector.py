@@ -425,7 +425,8 @@ def aggregate(orders, margin_by_ext=None):
         if e["upsells"]:
             cell["upsCount"] += 1
             cell["upsSum"] += e["upsellSum"]
-        cell["margin"] += mbe.get(str(e["externalId"]), 0.0)
+        _m = mbe.get(str(e["externalId"]))
+        cell["margin"] += (_m.get("gross", 0.0) if isinstance(_m, dict) else (_m or 0.0))
         if e["externalId"] and len(cell["extIds"]) < 500:
             cell["extIds"].append(str(e["externalId"]))
         # артикулы этой категории (по магазину) — для раскрытия в приложении
@@ -484,12 +485,20 @@ def build_ord(orders, mbe=None):
             catkey, catname = fbkey(cats[0]), cats[0]
         else:
             catkey, catname = "_no_cat", "(без категорії)"
-        margin = mbe.get(str(e["externalId"]), 0.0)
+        # маржа/апрув/выкуп из сматченного MyDrop-заказа (по внешнему номеру);
+        # маржа = ВАЛОВА (продажна − дроп). Если MyDrop не сматчился — апрув по SalesDrive, маржа 0.
+        m = mbe.get(str(e["externalId"]))
+        if isinstance(m, dict):
+            margin = m.get("gross", 0.0); drop = m.get("drop", 0.0)
+            approved = m.get("approved", 0); sold = m.get("sold", 0)
+        else:
+            margin = 0.0; drop = 0.0; sold = 0
+            approved = 1 if str(x.get("statusId")) in APRUV_STATUS else 0
         out.setdefault(fbkey(e["source"]), {}).setdefault(day, {})[oid] = {
             "catKey": catkey, "catName": catname,
-            "approved": 1 if str(x.get("statusId")) in APRUV_STATUS else 0,
+            "approved": approved, "sold": sold,
             "sum": e["mainSum"], "upsSum": e["upsellSum"], "upsCount": 1 if e["upsells"] else 0,
-            "margin": margin, "drop": round((e["mainSum"] or 0) - margin, 2),
+            "margin": margin, "drop": drop,
             "items": items, "ext": str(e["externalId"] or ""),
         }
     return out
@@ -551,12 +560,13 @@ def build_phone_ord(md_orders):
                 cat = p["category"]
                 item = {"sku": a, "name": nm, "img": p["img"] or "", "href": "", "price": total}
                 break
-        margin = _num(m.get("realMargin"))
-        drop = _num(m.get("dropPrice")) or (total - margin if margin else 0.0)
+        appr, sold = _md_flags(m)
+        drop = _num(m.get("dropPrice"))
+        gross = round(total - drop, 2) if appr else 0.0   # валова (продажна − дроп) на апрувнутих
         out.setdefault(fbkey(src), {}).setdefault(day, {})[oid] = {
             "catKey": fbkey(cat) if cat else "_no_cat", "catName": cat or "(без категорії)",
-            "approved": _md_approved(m), "sum": total, "upsSum": 0.0, "upsCount": 0,
-            "margin": margin, "drop": round(drop, 2),
+            "approved": appr, "sold": sold, "sum": total, "upsSum": 0.0, "upsCount": 0,
+            "margin": gross, "drop": drop,
             "items": [item] if item else [], "ext": str(m.get("id") or ""), "phone": 1,
         }
     return out
@@ -597,9 +607,11 @@ def reaggregate_ads_from_ord(ordtree):
                     continue
                 ck = c.get("catKey", "_no_cat")
                 cell = cells.setdefault(ck, {"cat": c.get("catName") or ck, "leads": 0,
-                                             "approved": 0, "sum": 0.0, "upsCount": 0, "upsSum": 0.0, "margin": 0.0})
+                                             "approved": 0, "sold": 0, "sum": 0.0,
+                                             "upsCount": 0, "upsSum": 0.0, "margin": 0.0})
                 cell["leads"] += 1
                 cell["approved"] += c.get("approved", 0) or 0
+                cell["sold"] += c.get("sold", 0) or 0
                 cell["sum"] += c.get("sum", 0) or 0
                 cell["upsCount"] += c.get("upsCount", 0) or 0
                 cell["upsSum"] += c.get("upsSum", 0) or 0
@@ -730,12 +742,32 @@ def build_margin_index(md_orders):
     for m in md_orders:
         ext = cache.get(str(m.get("id")))
         if ext:
-            mar = 0.0
-            for mk in MARGIN_KEYS:
-                if mk in m:
-                    mar = _num(m.get(mk)); break
-            mbe[ext] = mar
+            total = _num(m.get("total"))
+            drop = _num(m.get("dropPrice"))
+            appr, sold = _md_flags(m)
+            mbe[ext] = {
+                "total": total, "drop": drop,
+                "gross": round(total - drop, 2) if appr else 0.0,  # валова на апрувнутих
+                "approved": appr, "sold": sold,
+            }
     return mbe
+
+
+# --- статусы MyDrop для трекера рекламы ---
+# «Апрув» = заказ прошёл колл-центр и ушёл в исполнение (всё, кроме Новый/Недозвон/Вайбер/Дубль/…).
+MD_NOT_APPROVED = ("новый", "новые", "новий", "недозвон", "вайбер", "дубл",
+                   "не апрув", "не учит", "обмен", "обмін", "хорошоп")
+
+
+def _md_flags(m):
+    """(approved, sold) по статусу MyDrop. sold = финальный успешный (выкуплен)."""
+    st = m.get("orderStatus") or {}
+    title = str(st.get("title") or "").strip().lower()
+    final = st.get("final") is True
+    typ = str(st.get("type") or "").strip().lower()
+    approved = 0 if any(w in title for w in MD_NOT_APPROVED) else 1
+    sold = 1 if (final and typ == "success") else 0
+    return approved, sold
 
 
 def _flat_str_values(o, prefix="", depth=0, acc=None):
