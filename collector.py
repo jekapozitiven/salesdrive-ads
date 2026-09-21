@@ -732,6 +732,25 @@ def mydrop_probe(days):
                 m_phsku += 1
     print(f"\nДЖОЙН: телефон {m_ph}/{tot}; телефон+артикул {m_phsku}/{tot}")
 
+    # --- выгрузка образца в Firebase: поле «Источник трафика», товары, внешний номер ---
+    if FIREBASE_DB_URL:
+        srcfields = {}
+        for m in md:
+            for p, vals in _flat_str_values(m).items():
+                if re.search(r"источник|джерел|трафик|traffic|source|utm|канал", p, re.I):
+                    srcfields.setdefault(p, set()).update(vals)
+        srcfields = {k: sorted(v)[:30] for k, v in srcfields.items()}
+        dbg = {"at": dt.datetime.now().isoformat(), "count": len(md),
+               "allKeys": sorted(str(k) for k in md[0].keys()),
+               "trafficFields": srcfields, "samples": md[:3]}
+        try:
+            requests.put(f"{FIREBASE_DB_URL}/shop-reports/mydrop-debug.json",
+                         data=json.dumps(dbg, ensure_ascii=False, default=str).encode("utf-8"),
+                         headers={"Content-Type": "application/json"}, timeout=60)
+            print("MyDrop debug -> shop-reports/mydrop-debug")
+        except Exception as e:
+            print(f"mydrop-debug: {e}")
+
 
 def _prom_groups(token):
     """Категорії з Prom (groups/list) за токеном магазину."""
