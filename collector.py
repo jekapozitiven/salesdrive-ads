@@ -510,6 +510,40 @@ def push_ord_firebase(ordtree):
     print(f"Firebase ads-ord: заказов записано {n}")
 
 
+def reaggregate_ads_from_ord(ordtree):
+    """Пересобрать ads/<src>/<day> ИЗ ads-ord (там и SalesDrive, и телефонные из MyDrop) —
+    единый источник правды, чтобы телефонные заказы не затирались."""
+    if not FIREBASE_DB_URL:
+        return
+    n = 0
+    for src, days in ordtree.items():
+        for day in days:
+            try:
+                ords = requests.get(
+                    f"{FIREBASE_DB_URL}/shop-reports/ads-ord/{quote(src, safe='')}/{day}.json",
+                    timeout=40).json() or {}
+            except Exception:
+                ords = {}
+            cells = {}
+            for oid, c in ords.items():
+                if not c:
+                    continue
+                ck = c.get("catKey", "_no_cat")
+                cell = cells.setdefault(ck, {"cat": c.get("catName") or ck, "leads": 0,
+                                             "approved": 0, "sum": 0.0, "upsCount": 0, "upsSum": 0.0, "margin": 0.0})
+                cell["leads"] += 1
+                cell["approved"] += c.get("approved", 0) or 0
+                cell["sum"] += c.get("sum", 0) or 0
+                cell["upsCount"] += c.get("upsCount", 0) or 0
+                cell["upsSum"] += c.get("upsSum", 0) or 0
+                cell["margin"] += c.get("margin", 0) or 0
+            requests.put(f"{FIREBASE_DB_URL}/shop-reports/ads/{quote(src, safe='')}/{day}.json",
+                         data=json.dumps(cells, ensure_ascii=False).encode("utf-8"),
+                         headers={"Content-Type": "application/json"}, timeout=60)
+            n += 1
+    print(f"Firebase ads: пересобрано дней {n} из ads-ord")
+
+
 def push_articles_firebase(articles):
     """PUT списка артикулов по категориям в shop-reports/ads-articles (для раскрытия категории).
     ВАЖНО: артикулы содержат / . ( ) — их НЕЛЬЗЯ использовать как ключи Firebase.
@@ -907,13 +941,15 @@ def main():
     if not APRUV_STATUS:
         print("\n(!) APRUV_STATUS не задан — 'апрув' везде 0. Добавь секрет APRUV_STATUS "
               "со списком id статусов-апрув через запятую.")
-    push_ads_firebase(agg)
-    # поордерная детализация (товары, дроп, маржа) — постоянная история для раскрытия
+    # поордерная детализация (товары, дроп, маржа) — постоянная история;
+    # ads собираем ИЗ ads-ord, чтобы учитывались и телефонные заказы из MyDrop.
     try:
         ordtree = build_ord(orders, mbe)
         push_ord_firebase(ordtree)
+        reaggregate_ads_from_ord(ordtree)
     except Exception as e:
         print(f"ads-ord: {e}")
+        push_ads_firebase(agg)   # запасной путь, если поордерная сборка упала
 
 
 if __name__ == "__main__":
