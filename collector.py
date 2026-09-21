@@ -17,6 +17,7 @@ BBB CLUB — сборщик рекламной статистики по кам�
 """
 import os, sys, json, time, re, datetime as dt
 from collections import Counter
+from urllib.parse import quote
 import requests
 
 SD_URL    = os.environ.get("SALESDRIVE_URL", "").strip().rstrip("/")
@@ -434,6 +435,59 @@ def push_ads_firebase(agg):
     print(f"Firebase ads: HTTP {r.status_code}, источников={len(agg)}")
 
 
+def build_live(orders, mbe=None, recent=2):
+    """Пер-заказные записи за последние `recent` дней — «подсев» для мгновенной вкладки
+    (вебхук держит их свежими, коллектор делает полными и добавляет маржу).
+    Возвращает (live, complete_days). live: srckey -> day -> oid -> {...}."""
+    mbe = mbe or {}
+    today = dt.date.today()
+    days_ok = {(today - dt.timedelta(days=i)).isoformat() for i in range(recent)}
+    live = {}
+    for x in orders:
+        e = extract(x)
+        if e["source"] not in WANTED_SOURCES:
+            continue
+        day = e["date"]
+        if day not in days_ok:
+            continue
+        oid = str(x.get("id") or "")
+        if not oid:
+            continue
+        cats = order_categories(e)
+        if len(cats) > 1:
+            catkey, catname = MIXED_KEY, "Потребує розподілу (кілька категорій)"
+        elif cats:
+            catkey, catname = fbkey(cats[0]), cats[0]
+        else:
+            catkey, catname = "_no_cat", "(без категорії)"
+        live.setdefault(fbkey(e["source"]), {}).setdefault(day, {})[oid] = {
+            "catKey": catkey, "catName": catname,
+            "approved": 1 if str(x.get("statusId")) in APRUV_STATUS else 0,
+            "sum": e["mainSum"], "upsSum": e["upsellSum"],
+            "upsCount": 1 if e["upsells"] else 0,
+            "margin": mbe.get(str(e["externalId"]), 0.0),
+        }
+    return live, sorted(days_ok)
+
+
+def push_live_firebase(live, complete_days):
+    """PATCH пер-заказных записей в ads-live-ord (мерж — не стираем свежие из вебхука)
+    + список полных дней в ads-live-meta/completeDays."""
+    if not FIREBASE_DB_URL:
+        return
+    n = 0
+    for srckey, days in live.items():
+        for day, ords in days.items():
+            url = f"{FIREBASE_DB_URL}/shop-reports/ads-live-ord/{quote(srckey, safe='')}/{day}.json"
+            requests.patch(url, data=json.dumps(ords, ensure_ascii=False).encode("utf-8"),
+                           headers={"Content-Type": "application/json"}, timeout=60)
+            n += len(ords)
+    requests.put(f"{FIREBASE_DB_URL}/shop-reports/ads-live-meta/completeDays.json",
+                 data=json.dumps(complete_days).encode("utf-8"),
+                 headers={"Content-Type": "application/json"}, timeout=30)
+    print(f"Firebase ads-live: заказов подсеяно {n}, полные дни {complete_days}")
+
+
 def push_articles_firebase(articles):
     """PUT списка артикулов по категориям в shop-reports/ads-articles (для раскрытия категории).
     ВАЖНО: артикулы содержат / . ( ) — их НЕЛЬЗЯ использовать как ключи Firebase.
@@ -814,6 +868,12 @@ def main():
               "со списком id статусов-апрув через запятую.")
     push_ads_firebase(agg)
     push_articles_firebase(articles)
+    # подсев мгновенной вкладки (последние 2 дня) — полнота + маржа
+    try:
+        live, complete_days = build_live(orders, mbe)
+        push_live_firebase(live, complete_days)
+    except Exception as e:
+        print(f"ads-live подсев: {e}")
 
 
 if __name__ == "__main__":
