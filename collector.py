@@ -490,13 +490,13 @@ def build_ord(orders, mbe=None):
         m = mbe.get(str(e["externalId"]))
         if isinstance(m, dict):
             margin = m.get("gross", 0.0); drop = m.get("drop", 0.0)
-            approved = m.get("approved", 0); sold = m.get("sold", 0)
+            approved = m.get("approved", 0); sold = m.get("sold", 0); refused = m.get("refused", 0)
         else:
-            margin = 0.0; drop = 0.0; sold = 0
+            margin = 0.0; drop = 0.0; sold = 0; refused = 0
             approved = 1 if str(x.get("statusId")) in APRUV_STATUS else 0
         out.setdefault(fbkey(e["source"]), {}).setdefault(day, {})[oid] = {
             "catKey": catkey, "catName": catname,
-            "approved": approved, "sold": sold,
+            "approved": approved, "sold": sold, "refused": refused,
             "sum": e["mainSum"], "upsSum": e["upsellSum"], "upsCount": 1 if e["upsells"] else 0,
             "margin": margin, "drop": drop,
             "items": items, "ext": str(e["externalId"] or ""),
@@ -560,12 +560,12 @@ def build_phone_ord(md_orders):
                 cat = p["category"]
                 item = {"sku": a, "name": nm, "img": p["img"] or "", "href": "", "price": total}
                 break
-        appr, sold = _md_flags(m)
+        appr, sold, refused = _md_flags(m)
         drop = _num(m.get("dropPrice"))
         gross = round(total - drop, 2) if appr else 0.0   # валова (продажна − дроп) на апрувнутих
         out.setdefault(fbkey(src), {}).setdefault(day, {})[oid] = {
             "catKey": fbkey(cat) if cat else "_no_cat", "catName": cat or "(без категорії)",
-            "approved": appr, "sold": sold, "sum": total, "upsSum": 0.0, "upsCount": 0,
+            "approved": appr, "sold": sold, "refused": refused, "sum": total, "upsSum": 0.0, "upsCount": 0,
             "margin": gross, "drop": drop,
             "items": [item] if item else [], "ext": str(m.get("id") or ""), "phone": 1,
         }
@@ -607,11 +607,12 @@ def reaggregate_ads_from_ord(ordtree):
                     continue
                 ck = c.get("catKey", "_no_cat")
                 cell = cells.setdefault(ck, {"cat": c.get("catName") or ck, "leads": 0,
-                                             "approved": 0, "sold": 0, "sum": 0.0,
+                                             "approved": 0, "sold": 0, "refused": 0, "sum": 0.0,
                                              "upsCount": 0, "upsSum": 0.0, "margin": 0.0})
                 cell["leads"] += 1
                 cell["approved"] += c.get("approved", 0) or 0
                 cell["sold"] += c.get("sold", 0) or 0
+                cell["refused"] += c.get("refused", 0) or 0
                 cell["sum"] += c.get("sum", 0) or 0
                 cell["upsCount"] += c.get("upsCount", 0) or 0
                 cell["upsSum"] += c.get("upsSum", 0) or 0
@@ -744,11 +745,11 @@ def build_margin_index(md_orders):
         if ext:
             total = _num(m.get("total"))
             drop = _num(m.get("dropPrice"))
-            appr, sold = _md_flags(m)
+            appr, sold, refused = _md_flags(m)
             mbe[ext] = {
                 "total": total, "drop": drop,
                 "gross": round(total - drop, 2) if appr else 0.0,  # валова на апрувнутих
-                "approved": appr, "sold": sold,
+                "approved": appr, "sold": sold, "refused": refused,
             }
     return mbe
 
@@ -760,14 +761,16 @@ MD_NOT_APPROVED = ("новый", "новые", "новий", "недозвон",
 
 
 def _md_flags(m):
-    """(approved, sold) по статусу MyDrop. sold = финальный успешный (выкуплен)."""
+    """(approved, sold, refused) по статусу MyDrop.
+    sold = финальный успешный (выкуплен); refused = финальный неуспешный (возврат/отказ)."""
     st = m.get("orderStatus") or {}
     title = str(st.get("title") or "").strip().lower()
     final = st.get("final") is True
     typ = str(st.get("type") or "").strip().lower()
     approved = 0 if any(w in title for w in MD_NOT_APPROVED) else 1
     sold = 1 if (final and typ == "success") else 0
-    return approved, sold
+    refused = 1 if (final and typ in ("failed", "danger", "fail")) else 0
+    return approved, sold, refused
 
 
 def _flat_str_values(o, prefix="", depth=0, acc=None):
