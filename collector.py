@@ -91,6 +91,66 @@ def category_of(sku, store=None):
     return product_of(sku, store)["category"]
 
 
+# --- артикул -> кампания Google Ads (из ads-google-skucamp, пишет Google-скрипт) ---
+# SKUCAMP[source] = { нормализованный_артикул: "Название кампании" }.
+# Разные бренды = разные артикулы, поэтому по артикулу заказ ложится в нужную кампанию.
+SKUCAMP = {}
+
+
+def _sku_forms(s):
+    """Варианты ключа для сопоставления item_id из Google и артикула заказа."""
+    s = (s or "").strip()
+    if not s:
+        return []
+    forms = {norm_sku(s), s.lower()}
+    seg = s.split(":")[-1].split("/")[-1].strip().lower()   # 'online:uk:UAH:Rap-RD266' -> 'rap-rd266'
+    if seg:
+        forms.add(seg)
+        forms.add(norm_sku(seg))
+    return [f for f in forms if f]
+
+
+def load_skucamp():
+    """Тянет ads-google-skucamp (по всем магазинам) и строит SKUCAMP: источник -> {форма_артикула: кампания}."""
+    global SKUCAMP
+    SKUCAMP = {}
+    if not FIREBASE_DB_URL:
+        return
+    try:
+        r = requests.get(f"{FIREBASE_DB_URL}/shop-reports/ads-google-skucamp.json", timeout=40)
+        data = r.json() if r.status_code == 200 else None
+    except Exception as e:
+        print(f"skucamp: не загрузил ({e})")
+        return
+    if not isinstance(data, dict):
+        return
+    for shop, pairs in data.items():
+        src = fbkey(shop)
+        idx = SKUCAMP.setdefault(src, {})
+        for pair in (pairs or []):
+            if not isinstance(pair, (list, tuple)) or len(pair) < 2:
+                continue
+            item, camp = pair[0], pair[1]
+            if not item or not camp:
+                continue
+            for f in _sku_forms(item):
+                idx.setdefault(f, camp)   # первое совпадение выигрывает
+    summ = ", ".join(f"{k.split('-')[-1]}={len(v)}" for k, v in SKUCAMP.items())
+    print("skucamp: " + (summ or "пусто"))
+
+
+def camp_of(source, skus):
+    """Кампания заказа по его артикулам (первый артикул, который есть в карте skucamp)."""
+    idx = SKUCAMP.get(fbkey(source)) or {}
+    if not idx:
+        return ""
+    for sku in (skus or []):
+        for f in _sku_forms(sku):
+            if f in idx:
+                return idx[f]
+    return ""
+
+
 def _dom(h):
     m = re.search(r"https?://([^/]+)", h or "")
     return m.group(1).lower().replace("www.", "") if m else ""
@@ -494,8 +554,9 @@ def build_ord(orders, mbe=None):
         else:
             margin = 0.0; drop = 0.0; sold = 0; refused = 0
             approved = 1 if str(x.get("statusId")) in APRUV_STATUS else 0
+        camp = camp_of(e["source"], e["skus"])
         out.setdefault(fbkey(e["source"]), {}).setdefault(day, {})[oid] = {
-            "catKey": catkey, "catName": catname,
+            "catKey": catkey, "catName": catname, "camp": camp,
             "approved": approved, "sold": sold, "refused": refused,
             "sum": e["mainSum"], "upsSum": e["upsellSum"], "upsCount": 1 if e["upsells"] else 0,
             "margin": margin, "drop": drop,
@@ -563,8 +624,9 @@ def build_phone_ord(md_orders):
         appr, sold, refused = _md_flags(m)
         drop = _num(m.get("dropPrice"))
         gross = round(total - drop, 2) if appr else 0.0   # валова (продажна − дроп) на апрувнутих
+        camp = camp_of(src, arts)
         out.setdefault(fbkey(src), {}).setdefault(day, {})[oid] = {
-            "catKey": fbkey(cat) if cat else "_no_cat", "catName": cat or "(без категорії)",
+            "catKey": fbkey(cat) if cat else "_no_cat", "catName": cat or "(без категорії)", "camp": camp,
             "approved": appr, "sold": sold, "refused": refused, "sum": total, "upsSum": 0.0, "upsCount": 0,
             "margin": gross, "drop": drop,
             "items": [item] if item else [], "ext": str(m.get("id") or ""), "phone": 1,
@@ -608,7 +670,7 @@ def reaggregate_ads_from_ord(ordtree):
                 ck = c.get("catKey", "_no_cat")
                 cell = cells.setdefault(ck, {"cat": c.get("catName") or ck, "leads": 0,
                                              "approved": 0, "sold": 0, "refused": 0, "sum": 0.0,
-                                             "upsCount": 0, "upsSum": 0.0, "margin": 0.0})
+                                             "upsCount": 0, "upsSum": 0.0, "margin": 0.0, "camps": {}})
                 cell["leads"] += 1
                 cell["approved"] += c.get("approved", 0) or 0
                 cell["sold"] += c.get("sold", 0) or 0
@@ -617,6 +679,20 @@ def reaggregate_ads_from_ord(ordtree):
                 cell["upsCount"] += c.get("upsCount", 0) or 0
                 cell["upsSum"] += c.get("upsSum", 0) or 0
                 cell["margin"] += c.get("margin", 0) or 0
+                # разбивка по кампании (по артикулу заказа) — чтобы одна категория в 2 кампаниях = 2 строки
+                camp = c.get("camp") or ""
+                mk = fbkey(camp) if camp else "_nocamp"
+                sub = cell["camps"].setdefault(mk, {"camp": camp, "leads": 0, "approved": 0,
+                                                    "sold": 0, "refused": 0, "sum": 0.0,
+                                                    "upsCount": 0, "upsSum": 0.0, "margin": 0.0})
+                sub["leads"] += 1
+                sub["approved"] += c.get("approved", 0) or 0
+                sub["sold"] += c.get("sold", 0) or 0
+                sub["refused"] += c.get("refused", 0) or 0
+                sub["sum"] += c.get("sum", 0) or 0
+                sub["upsCount"] += c.get("upsCount", 0) or 0
+                sub["upsSum"] += c.get("upsSum", 0) or 0
+                sub["margin"] += c.get("margin", 0) or 0
             requests.put(f"{FIREBASE_DB_URL}/shop-reports/ads/{quote(src, safe='')}/{day}.json",
                          data=json.dumps(cells, ensure_ascii=False).encode("utf-8"),
                          headers={"Content-Type": "application/json"}, timeout=60)
@@ -1033,6 +1109,9 @@ def main():
         cov = sum(1 for e in site if str(e["externalId"]) in mbe)
         print(f"Маржа сматчена: {cov}/{len(site)} сайтовых заказов")
 
+    # карта артикул -> кампания (для разнесения заказов по кампаниям Google Ads)
+    load_skucamp()
+
     agg, articles = aggregate(orders, mbe)
 
     # мастер-список каталога больше НЕ тянем: категории берём из рекламируемых
@@ -1068,6 +1147,15 @@ def main():
                 nph += len(ords)
         if nph:
             print(f"Телефонные с сайта (MyDrop, по примечанию): {nph}")
+        # диагностика: покрытие заказов картой артикул->кампания (проверка item_id ↔ наш артикул)
+        _cov_t = _cov_c = 0
+        for _src, _days in ordtree.items():
+            for _day, _os in _days.items():
+                for _o in _os.values():
+                    _cov_t += 1
+                    if _o.get("camp"):
+                        _cov_c += 1
+        print(f"Кампания по артикулу: сматчено {_cov_c}/{_cov_t} заказов")
         push_ord_firebase(ordtree)
         reaggregate_ads_from_ord(ordtree)
     except Exception as e:
