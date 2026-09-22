@@ -91,27 +91,32 @@ def category_of(sku, store=None):
     return product_of(sku, store)["category"]
 
 
-# --- артикул -> кампания Google Ads (из ads-google-skucamp, пишет Google-скрипт) ---
-# SKUCAMP[source] = { нормализованный_артикул: "Название кампании" }.
-# Разные бренды = разные артикулы, поэтому по артикулу заказ ложится в нужную кампанию.
+# --- название товара -> кампания Google Ads (из ads-google-skucamp, пишет Google-скрипт) ---
+# SKUCAMP[source] = { ключ_названия: "Название кампании" }.
+# item_id в Google — числовой id фида, которого нет в наших заказах; общее поле — НАЗВАНИЕ товара
+# (и у нас, и в Merchant — из одного фида Prom). Разные бренды -> разные названия -> нужная кампания.
 SKUCAMP = {}
+_SIZES = {"xs", "s", "m", "l", "xl", "xxl", "xxxl", "xxxxl"}
 
 
-def _sku_forms(s):
-    """Варианты ключа для сопоставления item_id из Google и артикула заказа."""
-    s = (s or "").strip()
-    if not s:
-        return []
-    forms = {norm_sku(s), s.lower()}
-    seg = s.split(":")[-1].split("/")[-1].strip().lower()   # 'online:uk:UAH:Rap-RD266' -> 'rap-rd266'
-    if seg:
-        forms.add(seg)
-        forms.add(norm_sku(seg))
-    return [f for f in forms if f]
+def _title_key(s):
+    """Нормализация названия -> стабильный ключ (совпадает с normTitle в Google-скрипте):
+    нижний регистр, только буквы/цифры (пробел-разделитель), убрать хвостовой размер, первые 90 симв."""
+    s = re.sub(r"[\W_]+", " ", (s or "").lower(), flags=re.UNICODE).strip()
+    s = re.sub(r"\s+", " ", s)
+    parts = s.split(" ") if s else []
+    n = 0
+    while len(parts) > 1 and n < 3:
+        last = parts[-1]
+        if last in _SIZES or re.match(r"^\d{2,3}$", last):
+            parts.pop(); n += 1
+        else:
+            break
+    return " ".join(parts)[:90]
 
 
 def load_skucamp():
-    """Тянет ads-google-skucamp (по всем магазинам) и строит SKUCAMP: источник -> {форма_артикула: кампания}."""
+    """Тянет ads-google-skucamp (по всем магазинам) и строит SKUCAMP: источник -> {ключ_названия: кампания}."""
     global SKUCAMP
     SKUCAMP = {}
     if not FIREBASE_DB_URL:
@@ -130,24 +135,23 @@ def load_skucamp():
         for pair in (pairs or []):
             if not isinstance(pair, (list, tuple)) or len(pair) < 2:
                 continue
-            item, camp = pair[0], pair[1]
-            if not item or not camp:
+            key, camp = pair[0], pair[1]
+            if not key or not camp:
                 continue
-            for f in _sku_forms(item):
-                idx.setdefault(f, camp)   # первое совпадение выигрывает
+            idx.setdefault(str(key), camp)   # ключ уже нормализован Google-скриптом
     summ = ", ".join(f"{k.split('-')[-1]}={len(v)}" for k, v in SKUCAMP.items())
     print("skucamp: " + (summ or "пусто"))
 
 
-def camp_of(source, skus):
-    """Кампания заказа по его артикулам (первый артикул, который есть в карте skucamp)."""
+def camp_of(source, names):
+    """Кампания заказа по названию товара (первое название, совпавшее с картой skucamp)."""
     idx = SKUCAMP.get(fbkey(source)) or {}
     if not idx:
         return ""
-    for sku in (skus or []):
-        for f in _sku_forms(sku):
-            if f in idx:
-                return idx[f]
+    for nm in (names or []):
+        k = _title_key(nm)
+        if k and k in idx:
+            return idx[k]
     return ""
 
 
@@ -554,7 +558,7 @@ def build_ord(orders, mbe=None):
         else:
             margin = 0.0; drop = 0.0; sold = 0; refused = 0
             approved = 1 if str(x.get("statusId")) in APRUV_STATUS else 0
-        camp = camp_of(e["source"], e["skus"])
+        camp = camp_of(e["source"], [it.get("name") for it in items])
         out.setdefault(fbkey(e["source"]), {}).setdefault(day, {})[oid] = {
             "catKey": catkey, "catName": catname, "camp": camp,
             "approved": approved, "sold": sold, "refused": refused,
@@ -624,7 +628,7 @@ def build_phone_ord(md_orders):
         appr, sold, refused = _md_flags(m)
         drop = _num(m.get("dropPrice"))
         gross = round(total - drop, 2) if appr else 0.0   # валова (продажна − дроп) на апрувнутих
-        camp = camp_of(src, arts)
+        camp = camp_of(src, [item["name"]] if item else [])
         out.setdefault(fbkey(src), {}).setdefault(day, {})[oid] = {
             "catKey": fbkey(cat) if cat else "_no_cat", "catName": cat or "(без категорії)", "camp": camp,
             "approved": appr, "sold": sold, "refused": refused, "sum": total, "upsSum": 0.0, "upsCount": 0,
