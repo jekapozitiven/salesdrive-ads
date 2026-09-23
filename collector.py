@@ -585,6 +585,45 @@ def _md_approved(m):
     return 1 if any(w in t for w in MD_APPROVE_WORDS) else 0
 
 
+def phone_debug(md_orders):
+    """Диагностика телефонных заказов: выписывает в Firebase все заказы MyDrop, у которых
+    в примечании (description) есть слово «сайт»/«site» — с телефоном, датой, текстом и тем,
+    распознались ли фраза и магазин. Чтобы видеть, доходит ли заказ до коллектора и почему пропущен."""
+    if not FIREBASE_DB_URL:
+        return
+    cands = []
+    n_site = 0
+    for m in md_orders:
+        note = str(m.get("description") or "")
+        low = note.lower()
+        if "сайт" not in low and "site" not in low:
+            continue
+        n_site += 1
+        shop = None
+        for rx, src, store in MD_SHOP_FROM_NOTE:
+            if rx.search(note):
+                shop = src
+                break
+        cands.append({
+            "id": m.get("id"),
+            "phone": str(m.get("phone") or ""),
+            "dateTime": m.get("dateTime"),
+            "note": note[:140],
+            "matchedNote": bool(re.search(r"с\s*сайт", note, re.I)),
+            "shop": shop,
+            "createdWith": m.get("createdWith"),
+        })
+    dbg = {"at": dt.datetime.now().isoformat(), "mdTotal": len(md_orders),
+           "withSait": n_site, "candidates": cands[:60]}
+    try:
+        requests.put(f"{FIREBASE_DB_URL}/shop-reports/phone-debug.json",
+                     data=json.dumps(dbg, ensure_ascii=False, default=str).encode("utf-8"),
+                     headers={"Content-Type": "application/json"}, timeout=60)
+        print(f"phone-debug: MyDrop заказов {len(md_orders)}, с 'сайт' в примечании {n_site} -> shop-reports/phone-debug")
+    except Exception as e:
+        print(f"phone-debug: {e}")
+
+
 def build_phone_ord(md_orders):
     """Телефонные заказы с сайта: MyDrop-заказы, где в примечании (description) есть
     «с сайта <магазин>». Магазин из примечания, категория из артикула (в примечании
@@ -1107,6 +1146,7 @@ def main():
     if MYDROP_KEY:
         md = mydrop_fetch(DAYS)
         print(f"MyDrop: заказов {len(md)}")
+        phone_debug(md)   # диагностика: какие заказы с «сайт» в примечании реально пришли из MyDrop
         mbe = build_margin_index(md)
         site = [extract(x) for x in orders]
         site = [e for e in site if e["source"] in WANTED_SOURCES]
