@@ -765,10 +765,15 @@ MYDROP_KEY = os.environ.get("MYDROP_API_KEY", "").strip()
 MYDROP_URL = os.environ.get("MYDROP_BASE_URL",
                             "https://backend.mydrop.com.ua/dropshipper/api/orders").strip()
 MARGIN_KEYS = ("realMargin", "margin", "real_margin")
+# потолок страниц MyDrop (20 заказов/стр). Было 80 -> обрыв на 1600 заказов, из-за чего
+# терялись и телефонные заказы, и часть маржи. Поднято и вынесено в env (MD_MAX_PAGES).
+MD_MAX_PAGES = int(os.environ.get("MD_MAX_PAGES", "500"))
 
 
-def mydrop_fetch(days, max_pages=80):
+def mydrop_fetch(days, max_pages=None):
     """Заказы MyDrop за последние `days` дней (для джойна по внешнему номеру)."""
+    if max_pages is None:
+        max_pages = MD_MAX_PAGES
     if not MYDROP_KEY:
         print("Нет MYDROP_API_KEY — MyDrop пропускаю.")
         return []
