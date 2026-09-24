@@ -591,9 +591,14 @@ def phone_debug(md_orders):
     распознались ли фраза и магазин. Чтобы видеть, доходит ли заказ до коллектора и почему пропущен."""
     if not FIREBASE_DB_URL:
         return
+    target = re.sub(r"\D", "", os.environ.get("MD_DEBUG_PHONE", "0990760920"))[-9:]
     cands = []
     n_site = 0
+    target_order = None
     for m in md_orders:
+        ph = re.sub(r"\D", "", str(m.get("phone") or ""))[-9:]
+        if target and ph == target and target_order is None:
+            target_order = m   # полный заказ по искомому телефону — чтобы увидеть, где лежит заметка
         note = str(m.get("description") or "")
         low = note.lower()
         if "сайт" not in low and "site" not in low:
@@ -614,7 +619,9 @@ def phone_debug(md_orders):
             "createdWith": m.get("createdWith"),
         })
     dbg = {"at": dt.datetime.now().isoformat(), "mdTotal": len(md_orders),
-           "withSait": n_site, "candidates": cands[:60]}
+           "withSait": n_site, "candidates": cands[:60],
+           "targetPhone": target, "targetFound": target_order is not None,
+           "targetOrder": target_order}
     try:
         requests.put(f"{FIREBASE_DB_URL}/shop-reports/phone-debug.json",
                      data=json.dumps(dbg, ensure_ascii=False, default=str).encode("utf-8"),
