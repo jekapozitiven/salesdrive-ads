@@ -618,10 +618,18 @@ def phone_debug(md_orders):
             "shop": shop,
             "createdWith": m.get("createdWith"),
         })
+    # деталь заказа (в списке примечания нет — вдруг оно приходит в detail-эндпоинте)
+    target_detail = None
+    if target_order and target_order.get("id") and MYDROP_KEY:
+        try:
+            target_detail = mydrop_detail(target_order["id"],
+                                          {"X-API-KEY": MYDROP_KEY, "Accept": "application/json"})
+        except Exception as e:
+            target_detail = {"_err": str(e)}
     dbg = {"at": dt.datetime.now().isoformat(), "mdTotal": len(md_orders),
            "withSait": n_site, "candidates": cands[:60],
            "targetPhone": target, "targetFound": target_order is not None,
-           "targetOrder": target_order}
+           "targetOrder": target_order, "targetDetail": target_detail}
     try:
         requests.put(f"{FIREBASE_DB_URL}/shop-reports/phone-debug.json",
                      data=json.dumps(dbg, ensure_ascii=False, default=str).encode("utf-8"),
@@ -631,13 +639,43 @@ def phone_debug(md_orders):
         print(f"phone-debug: {e}")
 
 
+# у ВРУЧНУЮ созданных заказов (createdWith=web/manual) примечание НЕ приходит в списке —
+# оно есть только в детали заказа (отдельный запрос). У обычных заказов с сайта примечание в списке.
+MD_WEB_MARKERS = {"web", "manual", "hand"}
+MD_WEB_DETAIL_CAP = int(os.environ.get("MD_WEB_DETAIL_CAP", "400"))
+
+
+def _note_of(m, headers, counter):
+    """Примечание заказа: из списка (description); для ручных заказов дотягиваем деталь."""
+    note = str(m.get("description") or "")
+    if note.strip():
+        return note
+    cw = str(m.get("createdWith") or "").lower()
+    if headers and m.get("id") and cw in MD_WEB_MARKERS and counter[0] < MD_WEB_DETAIL_CAP:
+        counter[0] += 1
+        det = mydrop_detail(m.get("id"), headers) or {}
+        d = det.get("data") if isinstance(det.get("data"), dict) else det
+        if isinstance(d, dict):
+            for k in ("description", "comment", "note", "managerComment", "comments"):
+                v = d.get(k)
+                if isinstance(v, str) and v.strip():
+                    return v
+            for v in d.values():   # запасной: любое строковое поле с «сайт»
+                if isinstance(v, str) and "сайт" in v.lower():
+                    return v
+    return note
+
+
 def build_phone_ord(md_orders):
-    """Телефонные заказы с сайта: MyDrop-заказы, где в примечании (description) есть
-    «с сайта <магазин>». Магазин из примечания, категория из артикула (в примечании
-    или из товара), дроп/маржа/сумма из заказа MyDrop. Ключ oid = md<id> (не двоит)."""
+    """Телефонные заказы с сайта: MyDrop-заказы, где в примечании есть «с сайта <магазин>».
+    Примечание берём из списка, а для ручных (web) заказов — из детали заказа.
+    Магазин из примечания, категория из артикула/товара, дроп/маржа/сумма из заказа MyDrop.
+    Ключ oid = md<id> (не двоит)."""
     out = {}
+    headers = {"X-API-KEY": MYDROP_KEY, "Accept": "application/json"} if MYDROP_KEY else None
+    detail_counter = [0]
     for m in md_orders:
-        note = str(m.get("description") or "")
+        note = _note_of(m, headers, detail_counter)
         if not re.search(r"с\s*сайт", note, re.I):
             continue
         shop = None
