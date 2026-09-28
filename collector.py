@@ -1308,7 +1308,9 @@ def _phone_detail_debug(md_orders):
             "createdWith": m.get("createdWith"),
             "listKeys": sorted(m.keys()),
             "detailKeys": sorted(d.keys()) if isinstance(d, dict) else [],
-            "detailRaw": d,
+            # сырьё как строка — чтобы «плохие» ключи внутри карточки не роняли PUT
+            "listRaw": json.dumps(m, ensure_ascii=False),
+            "detailRaw": json.dumps(d, ensure_ascii=False) if isinstance(d, dict) else "",
         })
         time.sleep(0.2)
     payload = {"at": dt.datetime.now().isoformat(),
@@ -1316,9 +1318,9 @@ def _phone_detail_debug(md_orders):
                "listKeysUnion": sorted(list_keys),
                "samples": samples}
     url = f"{FIREBASE_DB_URL}/shop-reports/phone-detail-debug.json"
-    requests.put(url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                 headers={"Content-Type": "application/json"}, timeout=60)
-    print(f"phone-detail-debug: записано {len(samples)} карточек")
+    r = requests.put(url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                     headers={"Content-Type": "application/json"}, timeout=60)
+    print(f"phone-detail-debug: HTTP {r.status_code}, карточек {len(samples)}; ответ: {r.text[:200]}")
 
 
 def main():
