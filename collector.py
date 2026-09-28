@@ -245,6 +245,12 @@ def fetch_page(page, date_from):
             print(f"SalesDrive {r.status_code} (ліміт?) — чекаю {wait}s, спроба {attempt + 1}/4")
             time.sleep(wait)
             continue
+        # суточный лимit SalesDrive (1000/24h) прилетает как 400 с "API limit" — это НЕ ошибка кода,
+        # мягко пропускаем прогон (следующий по расписанию добере, когда квота сбросится).
+        if r.status_code == 400 and "limit" in (r.text or "").lower():
+            print("SalesDrive: досягнуто добовий ліміт (1000/24h) — пропускаю прогін, "
+                  "наступний за розкладом добере після скидання квоти.")
+            sys.exit(0)
         raise SystemExit(f"SalesDrive HTTP {r.status_code}: {r.text[:400]}")
     else:
         print("SalesDrive: ліміт не відпустив — пропускаю прогін (наступний за розкладом добере).")
@@ -722,6 +728,86 @@ def build_phone_ord(md_orders):
     return out
 
 
+# все ВРУЧНУЮ созданные заказы MyDrop (createdWith=web/manual) считаем «заказами по телефону».
+# Магазин/кампанию НЕ угадываем — пользователь назначит вручную во вкладке «Реклама».
+PHONE_SRC = "Телефон"
+MD_WEB_MARKERS_BUCKET = {"web", "manual", "hand"}
+
+
+# определение магазина по полю «Источник заказа» в MyDrop (значения Сайт-Блек/Бонна/Блінк).
+# Строгий поиск «Сайт-<магазин>» по всем строковым полям — чтобы не спутать с названием товара.
+_PHONE_SHOP_STRICT = [
+    (re.compile(r"сайт[\s\-_]*(блек|блэк|black)", re.I), "Сайт-Black-street"),
+    (re.compile(r"сайт[\s\-_]*(бонна|bonna)", re.I),      "Сайт-Bonna-shop"),
+    (re.compile(r"сайт[\s\-_]*(блін|блин|blink)", re.I),  "Хор-Blink"),
+]
+_PHONE_SHOP_BARE = [
+    (re.compile(r"блек|блэк|black", re.I), "Сайт-Black-street"),
+    (re.compile(r"бонна|bonna", re.I),     "Сайт-Bonna-shop"),
+    (re.compile(r"блін|блин|blink", re.I), "Хор-Blink"),
+]
+
+
+def _phone_shop(m):
+    """Магазин заказа по «Источник заказа». Сначала строго ищем 'Сайт-Блек/Бонна/Блінк' по всем полям,
+    затем — 'голое' название магазина в полях-источниках (ключ содержит источник/source/utm/traffic/канал)."""
+    parts = []
+    def collect(o):
+        if isinstance(o, str): parts.append(o)
+        elif isinstance(o, dict):
+            for vv in o.values(): collect(vv)
+        elif isinstance(o, list):
+            for vv in o: collect(vv)
+    collect(m)
+    blob = " | ".join(parts)
+    for rx, shop in _PHONE_SHOP_STRICT:
+        if rx.search(blob):
+            return shop
+    for k, v in m.items():
+        if re.search(r"источник|джерел|source|utm|traffic|канал", str(k), re.I) and isinstance(v, str):
+            for rx, shop in _PHONE_SHOP_BARE:
+                if rx.search(v):
+                    return shop
+    return ""
+
+
+def build_phone_bucket(md_orders):
+    """Ручные (web) заказы MyDrop -> ads-ord/Телефон/<день>/md<id>. camp пустой (назначается вручную).
+    Магазин определяется по полю «Источник заказа» (Сайт-Блек/Бонна/Блінк), товар/категория — по артикулу."""
+    out = {}
+    for m in md_orders:
+        cw = str(m.get("createdWith") or "").lower()
+        if cw not in MD_WEB_MARKERS_BUCKET:
+            continue
+        day = str(m.get("dateTime") or m.get("date") or "")[:10]
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", day):
+            continue
+        oid = "md" + str(m.get("id") or "")
+        if oid == "md":
+            continue
+        total = _num(m.get("total"))
+        drop = _num(m.get("dropPrice"))
+        appr, sold, refused = _md_flags(m)
+        gross = round(total - drop, 2) if appr else 0.0
+        cat, items = None, []
+        for p in (m.get("products") or []):
+            pr = p.get("product") or {}
+            sku = str(pr.get("sku") or p.get("sku") or "").strip()
+            title = pr.get("title") or ""
+            info = product_of(sku) if sku else {"category": None, "name": "", "img": ""}
+            if info.get("category") and not cat:
+                cat = info["category"]
+            items.append({"sku": sku, "name": title or info.get("name") or sku,
+                          "img": info.get("img") or "", "href": "", "price": _num(p.get("price"))})
+        out.setdefault(PHONE_SRC, {}).setdefault(day, {})[oid] = {
+            "catKey": fbkey(cat) if cat else "_no_cat", "catName": cat or "(без категорії)",
+            "camp": "", "shop": _phone_shop(m), "approved": appr, "sold": sold, "refused": refused,
+            "sum": total, "upsSum": 0.0, "upsCount": 0, "margin": gross, "drop": drop,
+            "items": items, "ext": str(m.get("id") or ""), "phone": 1,
+        }
+    return out
+
+
 def push_ord_firebase(ordtree):
     """PATCH пер-заказной детализации ПО ДНЯМ в ads-ord/<src>/<day> — мерж (не стираем свежие из вебхука),
     история навсегда (старые дни не трогаем)."""
@@ -1174,7 +1260,24 @@ def write_catlists():
     print("Майстер-список категорій: " + ", ".join(f"{k.split('-')[-1]}={len(v)}" for k, v in out.items()))
 
 
+def phone_only_run():
+    """Лёгкий частый прогон: ТОЛЬКО MyDrop -> ручные (web) заказы в корзину «Телефон».
+    Без SalesDrive (не тратит его суточную квоту). Ставится на каждые ~10 минут."""
+    days = int(os.environ.get("PHONE_DAYS", "3"))
+    pages = int(os.environ.get("PHONE_MAX_PAGES", "40"))
+    md = mydrop_fetch(days, pages)
+    print(f"phone-only: MyDrop заказов {len(md)}")
+    load_skucamp()   # чтобы категория/название тянулись как обычно (не обязательно, но пусть будет)
+    tree = build_phone_bucket(md)
+    n = sum(len(d) for s in tree.values() for d in s.values())
+    print(f"phone-only: телефонных заказов {n}")
+    push_ord_firebase(tree)
+
+
 def main():
+    if os.environ.get("SD_PHONE_ONLY", "").strip() in ("1", "true", "yes"):
+        phone_only_run()
+        return
     if os.environ.get("SD_MYDROP", "").strip() in ("1", "true", "yes"):
         mydrop_probe(DAYS)
         return
@@ -1232,15 +1335,15 @@ def main():
     # ads собираем ИЗ ads-ord, чтобы учитывались и телефонные заказы из MyDrop.
     try:
         ordtree = build_ord(orders, mbe)
-        # телефонные заказы с сайта из MyDrop (по примечанию) — в ту же ветку
-        phone_tree = build_phone_ord(md)
+        # все ручные (web) заказы MyDrop -> корзина «Телефон» (магазин/кампанию назначают вручную)
+        phone_tree = build_phone_bucket(md)
         nph = 0
         for src, days in phone_tree.items():
             for day, ords in days.items():
                 ordtree.setdefault(src, {}).setdefault(day, {}).update(ords)
                 nph += len(ords)
         if nph:
-            print(f"Телефонные с сайта (MyDrop, по примечанию): {nph}")
+            print(f"Заказы по телефону (ручные web-заказы MyDrop): {nph}")
         # диагностика: покрытие заказов картой артикул->кампания (проверка item_id ↔ наш артикул)
         _cov_t = _cov_c = 0
         for _src, _days in ordtree.items():
