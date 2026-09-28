@@ -1282,7 +1282,43 @@ def phone_only_run():
     tree = build_phone_bucket(md)
     n = sum(len(d) for s in tree.values() for d in s.values())
     print(f"phone-only: телефонных заказов {n}")
+    if os.environ.get("PHONE_DETAIL_DEBUG", "").strip() in ("1", "true", "yes"):
+        _phone_detail_debug(md)
     push_ord_firebase(tree)
+
+
+def _phone_detail_debug(md_orders):
+    """Разовая диагностика: где в MyDrop лежит «Источник заказа». Тянем карточку (detail)
+    первых телефонных заказов и пишем ВСЕ ключи + сырой объект в phone-detail-debug."""
+    if not FIREBASE_DB_URL or not MYDROP_KEY:
+        return
+    headers = {"X-API-KEY": MYDROP_KEY, "Accept": "application/json"}
+    phone = [m for m in md_orders
+             if str(m.get("createdWith") or "").lower() in MD_WEB_MARKERS_BUCKET]
+    samples = []
+    list_keys = set()
+    for m in phone[:5]:
+        oid = m.get("id")
+        for k in m.keys():
+            list_keys.add(k)
+        det = mydrop_detail(oid, headers)
+        d = det.get("data") if isinstance(det.get("data"), dict) else det
+        samples.append({
+            "id": oid,
+            "createdWith": m.get("createdWith"),
+            "listKeys": sorted(m.keys()),
+            "detailKeys": sorted(d.keys()) if isinstance(d, dict) else [],
+            "detailRaw": d,
+        })
+        time.sleep(0.2)
+    payload = {"at": dt.datetime.now().isoformat(),
+               "phoneCount": len(phone),
+               "listKeysUnion": sorted(list_keys),
+               "samples": samples}
+    url = f"{FIREBASE_DB_URL}/shop-reports/phone-detail-debug.json"
+    requests.put(url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                 headers={"Content-Type": "application/json"}, timeout=60)
+    print(f"phone-detail-debug: записано {len(samples)} карточек")
 
 
 def main():
