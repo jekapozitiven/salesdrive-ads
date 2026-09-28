@@ -748,33 +748,38 @@ _PHONE_SHOP_BARE = [
 ]
 
 
-def _phone_shop(m):
-    """Магазин заказа по «Источник заказа». Сначала строго ищем 'Сайт-Блек/Бонна/Блінк' по всем полям,
-    затем — 'голое' название магазина в полях-источниках (ключ содержит источник/source/utm/traffic/канал)."""
-    parts = []
-    def collect(o):
-        if isinstance(o, str): parts.append(o)
-        elif isinstance(o, dict):
-            for vv in o.values(): collect(vv)
-        elif isinstance(o, list):
-            for vv in o: collect(vv)
-    collect(m)
-    blob = " | ".join(parts)
-    for rx, shop in _PHONE_SHOP_STRICT:
-        if rx.search(blob):
-            return shop
-    for k, v in m.items():
-        if re.search(r"источник|джерел|source|utm|traffic|канал", str(k), re.I) and isinstance(v, str):
-            for rx, shop in _PHONE_SHOP_BARE:
-                if rx.search(v):
-                    return shop
+def _shop_from_source_title(title):
+    """«Источник заказа» (orderSource.title) MyDrop -> канонический магазин.
+    Значения: 'Сайт-Блек'->Black-street, 'Сайт-Bonna-shop'->Bonna-shop, 'Хор-Blink'->Blink."""
+    t = str(title or "")
+    if re.search(r"блек|блэк|black", t, re.I):
+        return "Black-street"
+    if re.search(r"бонна|bonna", t, re.I):
+        return "Bonna-shop"
+    if re.search(r"блін|блин|blink", t, re.I):
+        return "Blink"
     return ""
+
+
+def _phone_shop(m, detail=None):
+    """Магазин телефонного заказа по «Источник заказа».
+    Поле orderSource есть ТОЛЬКО в карточке заказа (detail), в списке его нет — поэтому detail обязателен."""
+    src = ""
+    if isinstance(detail, dict):
+        d = detail.get("data") if isinstance(detail.get("data"), dict) else detail
+        os_ = d.get("orderSource")
+        if isinstance(os_, dict):
+            src = os_.get("title") or ""
+        elif isinstance(os_, str):
+            src = os_
+    return _shop_from_source_title(src)
 
 
 def build_phone_bucket(md_orders):
     """Ручные (web) заказы MyDrop -> ads-ord/Телефон/<день>/md<id>. camp пустой (назначается вручную).
     Магазин определяется по полю «Источник заказа» (Сайт-Блек/Бонна/Блінк), товар/категория — по артикулу."""
     out = {}
+    headers = {"X-API-KEY": MYDROP_KEY, "Accept": "application/json"} if MYDROP_KEY else {}
     for m in md_orders:
         cw = str(m.get("createdWith") or "").lower()
         if cw not in MD_WEB_MARKERS_BUCKET:
@@ -785,6 +790,10 @@ def build_phone_bucket(md_orders):
         oid = "md" + str(m.get("id") or "")
         if oid == "md":
             continue
+        # магазин берём из карточки (orderSource есть только в detail, не в списке)
+        detail = mydrop_detail(m.get("id"), headers) if headers else {}
+        shop = _phone_shop(m, detail)
+        time.sleep(0.15)
         total = _num(m.get("total"))
         drop = _num(m.get("dropPrice"))
         appr, sold, refused = _md_flags(m)
@@ -801,7 +810,7 @@ def build_phone_bucket(md_orders):
                           "img": info.get("img") or "", "href": "", "price": _num(p.get("price"))})
         out.setdefault(PHONE_SRC, {}).setdefault(day, {})[oid] = {
             "catKey": fbkey(cat) if cat else "_no_cat", "catName": cat or "(без категорії)",
-            "camp": "", "shop": _phone_shop(m), "approved": appr, "sold": sold, "refused": refused,
+            "camp": "", "shop": shop, "approved": appr, "sold": sold, "refused": refused,
             "sum": total, "upsSum": 0.0, "upsCount": 0, "margin": gross, "drop": drop,
             "items": items, "ext": str(m.get("id") or ""), "phone": 1,
         }
