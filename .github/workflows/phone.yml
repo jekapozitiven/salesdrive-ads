@@ -24,4 +24,5 @@ jobs:
           FIREBASE_DB_URL: ${{ secrets.FIREBASE_DB_URL }}
           PHONE_DAYS: "3"
           PHONE_MAX_PAGES: "40"
+          PHONE_DETAIL_DEBUG: "1"   # ВРЕМЕННО: диагностика поля «Источник заказа». После проверки удалить эту строку.
         run: python collector.py
