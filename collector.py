@@ -914,7 +914,18 @@ def mydrop_fetch(days, max_pages=None):
     while page <= max_pages:
         params = {"date_type": "period", "date_start": date_from,
                   "date_end": dt.date.today().isoformat(), "page": page}
-        r = requests.get(MYDROP_URL, headers=headers, params=params, timeout=40)
+        r = None
+        for attempt in range(1, 6):
+            try:
+                r = requests.get(MYDROP_URL, headers=headers, params=params, timeout=40)
+                break
+            except requests.exceptions.RequestException as e:
+                wait = min(2 ** attempt, 30)
+                print(f"MyDrop сеть (стр.{page}, попытка {attempt}/5): {e} — жду {wait}с")
+                time.sleep(wait)
+        if r is None:
+            print(f"MyDrop: страница {page} не получена после 5 попыток — стоп.")
+            break
         if r.status_code != 200:
             print(f"MyDrop HTTP {r.status_code}: {r.text[:200]}")
             break
