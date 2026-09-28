@@ -1,0 +1,27 @@
+name: Phone orders (MyDrop only)
+
+# Лёгкий частый прогон: ТОЛЬКО MyDrop -> ручные (web) заказы в корзину «Телефон».
+# SalesDrive НЕ трогает, поэтому его суточную квоту (1000) не тратит.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/10 * * * *"   # каждые 10 минут
+
+jobs:
+  phone:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - name: Run phone-only collector
+        env:
+          SD_PHONE_ONLY: "1"
+          MYDROP_API_KEY: ${{ secrets.MYDROP_API_KEY }}
+          FIREBASE_DB_URL: ${{ secrets.FIREBASE_DB_URL }}
+          PHONE_DAYS: "3"
+          PHONE_MAX_PAGES: "40"
+        run: python collector.py
