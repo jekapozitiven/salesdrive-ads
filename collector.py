@@ -790,29 +790,39 @@ def build_phone_bucket(md_orders):
         oid = "md" + str(m.get("id") or "")
         if oid == "md":
             continue
-        # магазин берём из карточки (orderSource есть только в detail, не в списке)
+        # карточка заказа: orderSource (магазин), phone, index, фото товаров — всё это ТОЛЬКО в detail
         detail = mydrop_detail(m.get("id"), headers) if headers else {}
+        dd = detail.get("data") if isinstance(detail.get("data"), dict) else (detail or {})
         shop = _phone_shop(m, detail)
         time.sleep(0.15)
         total = _num(m.get("total"))
         drop = _num(m.get("dropPrice"))
         appr, sold, refused = _md_flags(m)
         gross = round(total - drop, 2) if appr else 0.0
+        # номер как в CRM (index) и телефон клиента — из карточки, с фолбэком на список
+        ext = str(dd.get("index") or m.get("index") or m.get("id") or "")
+        phone_num = str(dd.get("phone") or m.get("phone") or "").strip()
+        # товары берём из карточки (там есть promPictureUrl/фото); если нет — из списка
+        prods = dd.get("products") or m.get("products") or []
         cat, items = None, []
-        for p in (m.get("products") or []):
+        for p in prods:
             pr = p.get("product") or {}
             sku = str(pr.get("sku") or p.get("sku") or "").strip()
             title = pr.get("title") or ""
             info = product_of(sku) if sku else {"category": None, "name": "", "img": ""}
             if info.get("category") and not cat:
                 cat = info["category"]
+            # фото: полный URL из MyDrop (promPictureUrl) -> из Prom-фида (product_of) -> пусто
+            pic = pr.get("promPictureUrl") or ""
+            if not (isinstance(pic, str) and pic.startswith("http")):
+                pic = info.get("img") or ""
             items.append({"sku": sku, "name": title or info.get("name") or sku,
-                          "img": info.get("img") or "", "href": "", "price": _num(p.get("price"))})
+                          "img": pic, "href": "", "price": _num(p.get("price"))})
         out.setdefault(PHONE_SRC, {}).setdefault(day, {})[oid] = {
             "catKey": fbkey(cat) if cat else "_no_cat", "catName": cat or "(без категорії)",
             "camp": "", "shop": shop, "approved": appr, "sold": sold, "refused": refused,
             "sum": total, "upsSum": 0.0, "upsCount": 0, "margin": gross, "drop": drop,
-            "items": items, "ext": str(m.get("id") or ""), "phone": 1,
+            "items": items, "ext": ext, "phoneNum": phone_num, "phone": 1,
         }
     return out
 
