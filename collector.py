@@ -1031,9 +1031,25 @@ def build_margin_index(md_orders):
             total = _num(m.get("total"))
             drop = _num(m.get("dropPrice"))
             appr, sold, refused = _md_flags(m)
+            # Маржа — приоритет готовому полю MyDrop (realMargin = «Прибыль» в CRM).
+            # Если его нет — считаем как продажна − дроп. drop выводим из маржи, чтобы цифры сходились с CRM.
+            rm = None
+            for k in MARGIN_KEYS:
+                v = m.get(k)
+                if v not in (None, ""):
+                    rm = _num(v)
+                    break
+            if appr:
+                if rm is not None and rm != 0:
+                    gross = round(rm, 2)
+                    if total:
+                        drop = round(total - rm, 2)   # дроп = продажна − маржа (как в CRM)
+                else:
+                    gross = round(total - drop, 2)
+            else:
+                gross = 0.0
             mbe[ext] = {
-                "total": total, "drop": drop,
-                "gross": round(total - drop, 2) if appr else 0.0,  # валова на апрувнутих
+                "total": total, "drop": drop, "gross": gross,
                 "approved": appr, "sold": sold, "refused": refused,
             }
     return mbe
