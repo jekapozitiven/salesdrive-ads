@@ -1335,12 +1335,58 @@ def write_catlists():
     print("Майстер-список категорій: " + ", ".join(f"{k.split('-')[-1]}={len(v)}" for k, v in out.items()))
 
 
+def update_website_margins(md_orders, days):
+    """MyDrop-only обновление маржи сайтовых заказов (без SalesDrive). Матч по номеру заказа (ext).
+    Проставляет margin/drop/продажну уже существующим заказам ads-ord за последние `days` дней,
+    чтобы у свежих заказов маржа дотягивалась быстро, не завися от квоты SalesDrive."""
+    if not FIREBASE_DB_URL:
+        return
+    mbe = build_margin_index(md_orders)
+    if not mbe:
+        print("update-margins: индекс маржи пуст"); return
+    today = dt.date.today()
+    touched, patched = {}, 0
+    for src in ("Сайт-Black-street", "Сайт-Bonna-shop", "Хор-Blink"):
+        for dd in range(days + 1):
+            day = (today - dt.timedelta(days=dd)).isoformat()
+            url = f"{FIREBASE_DB_URL}/shop-reports/ads-ord/{quote(src, safe='')}/{day}.json"
+            try:
+                ords = requests.get(url, timeout=40).json() or {}
+            except Exception:
+                ords = {}
+            if not ords:
+                continue
+            upd = {}
+            for oid, o in ords.items():
+                if not o or o.get("phone"):          # телефонные не трогаем — у них своя маржа
+                    continue
+                m = mbe.get(str(o.get("ext") or ""))
+                if not isinstance(m, dict) or not m.get("gross"):
+                    continue                          # нет маржи в MyDrop — не перетираем нулём
+                ups = _num(o.get("upsSum"))
+                sale = round(max(_num(m.get("total")) - ups, 0.0), 2) or o.get("sum")
+                o2 = dict(o)
+                o2.update({"margin": m["gross"], "drop": m["drop"], "sum": sale,
+                           "approved": m["approved"], "sold": m["sold"], "refused": m["refused"]})
+                upd[oid] = o2
+            if upd:
+                requests.patch(url, data=json.dumps(upd, ensure_ascii=False).encode("utf-8"),
+                               headers={"Content-Type": "application/json"}, timeout=60)
+                patched += len(upd)
+                touched.setdefault(src, {})[day] = True
+    print(f"update-margins: обновлено сайтовых заказов {patched}")
+    if touched:
+        reaggregate_ads_from_ord(touched)
+
+
 def phone_only_run():
-    """Лёгкий частый прогон: ТОЛЬКО MyDrop -> ручные (web) заказы в корзину «Телефон».
-    Без SalesDrive (не тратит его суточную квоту). Ставится на каждые ~10 минут."""
+    """Лёгкий частый прогон: ТОЛЬКО MyDrop. Делает две вещи без SalesDrive (не тратит его квоту):
+    1) ручные (web) заказы -> корзина «Телефон»; 2) дотягивает маржу сайтовым заказам из MyDrop.
+    Ставится на каждые ~10 минут."""
     days = int(os.environ.get("PHONE_DAYS", "3"))
-    pages = int(os.environ.get("PHONE_MAX_PAGES", "40"))
-    md = mydrop_fetch(days, pages)
+    wdays = int(os.environ.get("WEBSITE_MARGIN_DAYS", "5"))
+    pages = int(os.environ.get("PHONE_MAX_PAGES", "120"))
+    md = mydrop_fetch(max(days, wdays), pages)   # выборка покрывает и дни телефонных, и дни маржи
     print(f"phone-only: MyDrop заказов {len(md)}")
     load_skucamp()   # чтобы категория/название тянулись как обычно (не обязательно, но пусть будет)
     tree = build_phone_bucket(md)
@@ -1349,6 +1395,8 @@ def phone_only_run():
     if os.environ.get("PHONE_DETAIL_DEBUG", "").strip() in ("1", "true", "yes"):
         _phone_detail_debug(md)
     push_ord_firebase(tree)
+    # дотянуть маржу сайтовым заказам из MyDrop (по номеру заказа) — без SalesDrive
+    update_website_margins(md, wdays)
 
 
 def _phone_detail_debug(md_orders):
