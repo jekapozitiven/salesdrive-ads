@@ -202,9 +202,15 @@ def extract(o):
     main = [p for p in prods if not p.get("upsell")]
     ups = [p for p in prods if p.get("upsell")]
     amt = lambda p: (p.get("price") or 0) * (p.get("amount") or 1)
+    _ph = (o.get("primaryContact") or {}).get("phone") or ""
+    if not _ph:
+        for _c in (o.get("contacts") or []):
+            if _c.get("phone"):
+                _ph = _c.get("phone"); break
     return {
         "id": o.get("id"),
         "externalId": o.get("externalId"),
+        "phone": re.sub(r"\D", "", str(_ph))[-9:],
         "date": (o.get("orderTime") or "")[:10],
         "statusId": o.get("statusId"),
         "shop": shop_of(o),
@@ -525,11 +531,12 @@ def push_ads_firebase(agg):
     print(f"Firebase ads: записано дней {n} по {len(agg)} источникам")
 
 
-def build_ord(orders, mbe=None):
+def build_ord(orders, mbe=None, mbe_ph=None):
     """Пер-заказная детализация (навсегда): srckey -> day -> oid -> запись с товарами.
     Запись: {catKey,catName,approved,sum,upsSum,upsCount,margin,drop,items,ext}.
     items: [{sku,name,img,href,price}]. drop = продажна − маржа (по факту MyDrop)."""
     mbe = mbe or {}
+    mbe_ph = mbe_ph or {}
     out = {}
     for x in orders:
         e = extract(x)
@@ -555,20 +562,33 @@ def build_ord(orders, mbe=None):
             catkey, catname = fbkey(cats[0]), cats[0]
         else:
             catkey, catname = "_no_cat", "(без категорії)"
-        # маржа/апрув/выкуп из сматченного MyDrop-заказа (по внешнему номеру);
-        # маржа = ВАЛОВА (продажна − дроп). Если MyDrop не сматчился — апрув по SalesDrive, маржа 0.
+        # ВСЕ деньги (продажна, дроп, маржа) берём из MyDrop. Матч: сначала по внешнему номеру,
+        # затем запасной — по телефону + полной сумме (для свежих заказов, у которых номер в MyDrop ещё не проставлен).
         m = mbe.get(str(e["externalId"]))
+        if not isinstance(m, dict):
+            ph = e.get("phone"); full = round(e["mainSum"] + e["upsellSum"])
+            cands = mbe_ph.get(ph) if ph else None
+            if cands:
+                hit = [info for (tt, info) in cands if abs(tt - full) <= 2]
+                if not hit and len(cands) == 1:
+                    hit = [cands[0][1]]
+                if hit:
+                    m = hit[0]
+        ups = e["upsellSum"]
         if isinstance(m, dict):
             margin = m.get("gross", 0.0); drop = m.get("drop", 0.0)
             approved = m.get("approved", 0); sold = m.get("sold", 0); refused = m.get("refused", 0)
+            # продажна з MyDrop (total). Допрод лишаємо окремо: продажна(осн.) = total − допрод
+            sale = round(max(_num(m.get("total")) - ups, 0.0), 2) or e["mainSum"]
         else:
             margin = 0.0; drop = 0.0; sold = 0; refused = 0
             approved = 1 if str(x.get("statusId")) in APRUV_STATUS else 0
+            sale = e["mainSum"]
         camp = camp_of(e["source"], [it.get("name") for it in items])
         out.setdefault(fbkey(e["source"]), {}).setdefault(day, {})[oid] = {
             "catKey": catkey, "catName": catname, "camp": camp,
             "approved": approved, "sold": sold, "refused": refused,
-            "sum": e["mainSum"], "upsSum": e["upsellSum"], "upsCount": 1 if e["upsells"] else 0,
+            "sum": sale, "upsSum": ups, "upsCount": 1 if e["upsells"] else 0,
             "margin": margin, "drop": drop,
             "items": items, "ext": str(e["externalId"] or ""),
         }
@@ -988,6 +1008,38 @@ def mydrop_detail(oid, headers):
     return {}
 
 
+def _md_margin_info(m):
+    """Маржа/дроп одного MyDrop-заказа: приоритет realMargin, иначе продажна−дроп."""
+    total = _num(m.get("total"))
+    appr, sold, refused = _md_flags(m)
+    rm = None
+    for k in MARGIN_KEYS:
+        v = m.get(k)
+        if v not in (None, ""):
+            rm = _num(v); break
+    if appr:
+        if rm is not None and rm != 0:
+            gross = round(rm, 2); drop = round(total - rm, 2) if total else _num(m.get("dropPrice"))
+        else:
+            drop = _num(m.get("dropPrice")); gross = round(total - drop, 2)
+    else:
+        gross = 0.0; drop = _num(m.get("dropPrice"))
+    return {"total": total, "drop": drop, "gross": gross,
+            "approved": appr, "sold": sold, "refused": refused}
+
+
+def build_margin_phone_index(md_orders):
+    """Запасной индекс маржи по ТЕЛЕФОНУ (+сумме) — для заказов, у которых внешний номер
+    в MyDrop ещё не проставлен (свежие). Поля phone/total есть в списке сразу, карточка не нужна."""
+    idx = {}
+    for m in md_orders:
+        ph = re.sub(r"\D", "", str(m.get("phone") or ""))[-9:]
+        if not ph:
+            continue
+        idx.setdefault(ph, []).append((round(_num(m.get("total"))), _md_margin_info(m)))
+    return idx
+
+
 def build_margin_index(md_orders):
     """Строит {внешний_номер: маржа}. Кэш id->внешний_номер в Firebase (тянем карточки
     только для новых заказов, маржу берём из списка — она дозревает)."""
@@ -1028,30 +1080,7 @@ def build_margin_index(md_orders):
     for m in md_orders:
         ext = cache.get(str(m.get("id")))
         if ext:
-            total = _num(m.get("total"))
-            drop = _num(m.get("dropPrice"))
-            appr, sold, refused = _md_flags(m)
-            # Маржа — приоритет готовому полю MyDrop (realMargin = «Прибыль» в CRM).
-            # Если его нет — считаем как продажна − дроп. drop выводим из маржи, чтобы цифры сходились с CRM.
-            rm = None
-            for k in MARGIN_KEYS:
-                v = m.get(k)
-                if v not in (None, ""):
-                    rm = _num(v)
-                    break
-            if appr:
-                if rm is not None and rm != 0:
-                    gross = round(rm, 2)
-                    if total:
-                        drop = round(total - rm, 2)   # дроп = продажна − маржа (как в CRM)
-                else:
-                    gross = round(total - drop, 2)
-            else:
-                gross = 0.0
-            mbe[ext] = {
-                "total": total, "drop": drop, "gross": gross,
-                "approved": appr, "sold": sold, "refused": refused,
-            }
+            mbe[ext] = _md_margin_info(m)
     return mbe
 
 
@@ -1379,16 +1408,19 @@ def main():
 
     # маржа из MyDrop по внешнему номеру (если задан ключ)
     mbe = {}
+    mbe_ph = {}
     md = []
     if MYDROP_KEY:
         md = mydrop_fetch(DAYS)
         print(f"MyDrop: заказов {len(md)}")
         phone_debug(md)   # диагностика: какие заказы с «сайт» в примечании реально пришли из MyDrop
         mbe = build_margin_index(md)
+        mbe_ph = build_margin_phone_index(md)
         site = [extract(x) for x in orders]
         site = [e for e in site if e["source"] in WANTED_SOURCES]
         cov = sum(1 for e in site if str(e["externalId"]) in mbe)
-        print(f"Маржа сматчена: {cov}/{len(site)} сайтовых заказов")
+        cov2 = sum(1 for e in site if str(e["externalId"]) not in mbe and e.get("phone") in mbe_ph)
+        print(f"Маржа сматчена: по номеру {cov}, доп. по телефону {cov2}, из {len(site)} сайтовых заказов")
 
     # карта артикул -> кампания (для разнесения заказов по кампаниям Google Ads)
     load_skucamp()
@@ -1418,7 +1450,7 @@ def main():
     # поордерная детализация (товары, дроп, маржа) — постоянная история;
     # ads собираем ИЗ ads-ord, чтобы учитывались и телефонные заказы из MyDrop.
     try:
-        ordtree = build_ord(orders, mbe)
+        ordtree = build_ord(orders, mbe, mbe_ph)
         # все ручные (web) заказы MyDrop -> корзина «Телефон» (магазин/кампанию назначают вручную)
         phone_tree = build_phone_bucket(md)
         nph = 0
