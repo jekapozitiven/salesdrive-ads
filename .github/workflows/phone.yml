@@ -4,9 +4,9 @@ name: Phone orders (MyDrop only)
 # SalesDrive НЕ трогает, поэтому его суточную квоту (1000) не тратит.
 
 on:
+  # Расписание убрано: запуск идёт снаружи через Cloudflare-воркер gh-scheduler
+  # (надёжный кран). GitHub-cron не используем.
   workflow_dispatch:
-  schedule:
-    - cron: "*/10 * * * *"   # каждые 10 минут
 
 jobs:
   phone:
