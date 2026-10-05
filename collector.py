@@ -815,11 +815,20 @@ def build_phone_bucket(md_orders):
         oid = "md" + str(m.get("id") or "")
         if oid == "md":
             continue
+        # не апрув / отмена / дубль — не храним. Проверяем ДО загрузки карточки (экономим запросы).
+        if _md_hidden(m):
+            out.setdefault(PHONE_SRC, {}).setdefault(day, {})[oid] = None   # удалить, если был
+            continue
         # карточка заказа: orderSource (магазин), phone, index, фото товаров — всё это ТОЛЬКО в detail
         detail = mydrop_detail(m.get("id"), headers) if headers else {}
         dd = detail.get("data") if isinstance(detail.get("data"), dict) else (detail or {})
         shop = _phone_shop(m, detail)
         time.sleep(0.15)
+        # берём только заказы с заполненным «Источник заказа». Нет источника — не добавляем
+        # (и чистим, если раньше был добавлен без источника).
+        if not shop:
+            out.setdefault(PHONE_SRC, {}).setdefault(day, {})[oid] = None
+            continue
         total = _num(m.get("total"))
         drop = _num(m.get("dropPrice"))
         appr, sold, refused = _md_flags(m)
