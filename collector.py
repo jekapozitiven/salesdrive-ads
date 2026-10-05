@@ -1419,8 +1419,13 @@ def phone_only_run():
     if os.environ.get("PHONE_DETAIL_DEBUG", "").strip() in ("1", "true", "yes"):
         _phone_detail_debug(md)
     push_ord_firebase(tree)
-    # дотянуть маржу сайтовым заказам из MyDrop (по номеру заказа) — без SalesDrive
-    update_website_margins(md, wdays)
+    # дотянуть маржу сайтовым заказам из MyDrop (по номеру заказа) — без SalesDrive.
+    # Оборачиваем: если MyDrop/Firebase подвисли на этом тяжёлом шаге — не роняем весь прогон,
+    # телефонные заказы уже записаны, маржа дотянется на следующем запуске.
+    try:
+        update_website_margins(md, wdays)
+    except Exception as e:
+        print(f"update-margins: пропущено из-за ошибки: {e}")
 
 
 def _phone_detail_debug(md_orders):
