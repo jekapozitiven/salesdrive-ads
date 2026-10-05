@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       probe:
-        description: "Разведка полей (оставь 1 для первого запуска)"
+        description: "Разведка полей (1 = разведка). Пусто/0 = боевой сбор."
         required: false
-        default: "1"
+        default: ""
       days:
         description: "За сколько последних дней тянуть"
         required: false
@@ -15,9 +15,8 @@ on:
         description: "Разведка MyDrop (поле связи + маржа): напиши 1"
         required: false
         default: ""
-  schedule:
-    - cron: "15 * * * *"   # раз в час — страховочный полный сбор (probe=0). Реалтайм даёт вебхук.
-    # ~10-15 запросов SalesDrive за прогон × 24 = ~240-360/сутки из 1000 — с запасом.
+  # Расписание убрано: запуск идёт снаружи через Cloudflare-воркер gh-scheduler
+  # (надёжный кран, раз в 2 часа). GitHub-cron не используем.
 
 jobs:
   collect:
