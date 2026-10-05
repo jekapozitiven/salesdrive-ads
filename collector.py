@@ -576,12 +576,17 @@ def build_ord(orders, mbe=None, mbe_ph=None):
                     m = hit[0]
         ups = e["upsellSum"]
         if isinstance(m, dict):
-            margin = m.get("gross", 0.0); drop = m.get("drop", 0.0)
+            # заказ в скрытом статусе (Недозвон/Новый/Отмена и т.п.) — не показываем: удаляем из базы
+            if m.get("hidden"):
+                out.setdefault(fbkey(e["source"]), {}).setdefault(day, {})[oid] = None
+                continue
+            # допрод — это тоже маржа: прибавляем к марже из MyDrop
+            margin = round(m.get("gross", 0.0) + ups, 2); drop = m.get("drop", 0.0)
             approved = m.get("approved", 0); sold = m.get("sold", 0); refused = m.get("refused", 0)
             # продажна з MyDrop (total). Допрод лишаємо окремо: продажна(осн.) = total − допрод
             sale = round(max(_num(m.get("total")) - ups, 0.0), 2) or e["mainSum"]
         else:
-            margin = 0.0; drop = 0.0; sold = 0; refused = 0
+            margin = ups; drop = 0.0; sold = 0; refused = 0   # без MyDrop: хотя бы допрод-маржа
             approved = 1 if str(x.get("statusId")) in APRUV_STATUS else 0
             sale = e["mainSum"]
         camp = camp_of(e["source"], [it.get("name") for it in items])
@@ -1008,6 +1013,19 @@ def mydrop_detail(oid, headers):
     return {}
 
 
+# Статусы MyDrop, которых НЕ должно быть в приложении вообще:
+# «до обработки» (ещё не лид) + отменённые/удалённые. Отказ (refused) оставляем — он нужен для выкупа.
+MD_HIDDEN_STATUS = ("новый", "новые", "новий", "недозвон", "недзвон", "вайбер", "viber",
+                    "дубл", "отмена", "отмен", "відміна", "скасов", "удален", "удалён",
+                    "видален", "видалено", "删")
+
+
+def _md_hidden(m):
+    """True, если заказ в статусе, который не должен попадать в приложение (необработанный/отменённый)."""
+    title = str((m.get("orderStatus") or {}).get("title") or "").strip().lower()
+    return any(w in title for w in MD_HIDDEN_STATUS)
+
+
 def _md_margin_info(m):
     """Маржа/дроп одного MyDrop-заказа: приоритет realMargin, иначе продажна−дроп."""
     total = _num(m.get("total"))
@@ -1025,7 +1043,7 @@ def _md_margin_info(m):
     else:
         gross = 0.0; drop = _num(m.get("dropPrice"))
     return {"total": total, "drop": drop, "gross": gross,
-            "approved": appr, "sold": sold, "refused": refused}
+            "approved": appr, "sold": sold, "refused": refused, "hidden": _md_hidden(m)}
 
 
 def build_margin_phone_index(md_orders):
@@ -1361,12 +1379,18 @@ def update_website_margins(md_orders, days):
                 if not o or o.get("phone"):          # телефонные не трогаем — у них своя маржа
                     continue
                 m = mbe.get(str(o.get("ext") or ""))
-                if not isinstance(m, dict) or not m.get("gross"):
+                if not isinstance(m, dict):
+                    continue
+                if m.get("hidden"):                   # стал Недозвон/Отмена и т.п. — убираем из базы
+                    upd[oid] = None
+                    continue
+                if not m.get("gross"):
                     continue                          # нет маржи в MyDrop — не перетираем нулём
                 ups = _num(o.get("upsSum"))
                 sale = round(max(_num(m.get("total")) - ups, 0.0), 2) or o.get("sum")
                 o2 = dict(o)
-                o2.update({"margin": m["gross"], "drop": m["drop"], "sum": sale,
+                o2.update({"margin": round(m["gross"] + ups, 2),   # допрод тоже маржа
+                           "drop": m["drop"], "sum": sale,
                            "approved": m["approved"], "sold": m["sold"], "refused": m["refused"]})
                 upd[oid] = o2
             if upd:
