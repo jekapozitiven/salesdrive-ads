@@ -580,8 +580,9 @@ def build_ord(orders, mbe=None, mbe_ph=None):
             if m.get("hidden"):
                 out.setdefault(fbkey(e["source"]), {}).setdefault(day, {})[oid] = None
                 continue
-            # допрод — это тоже маржа: прибавляем к марже из MyDrop
-            margin = round(m.get("gross", 0.0) + ups, 2); drop = m.get("drop", 0.0)
+            # маржа = realMargin («Прибыль» MyDrop). ОНА УЖЕ ВКЛЮЧАЕТ допродажу —
+            # поэтому ups отдельно НЕ прибавляем (иначе двойной счёт, трекер завышал маржу).
+            margin = round(m.get("gross", 0.0), 2); drop = m.get("drop", 0.0)
             approved = m.get("approved", 0); sold = m.get("sold", 0); refused = m.get("refused", 0)
             # продажна з MyDrop (total). Допрод лишаємо окремо: продажна(осн.) = total − допрод
             sale = round(max(_num(m.get("total")) - ups, 0.0), 2) or e["mainSum"]
@@ -1398,7 +1399,7 @@ def update_website_margins(md_orders, days):
                 ups = _num(o.get("upsSum"))
                 sale = round(max(_num(m.get("total")) - ups, 0.0), 2) or o.get("sum")
                 o2 = dict(o)
-                o2.update({"margin": round(m["gross"] + ups, 2),   # допрод тоже маржа
+                o2.update({"margin": round(m["gross"], 2),   # realMargin уже включает допрод — не прибавляем ups
                            "drop": m["drop"], "sum": sale,
                            "approved": m["approved"], "sold": m["sold"], "refused": m["refused"]})
                 upd[oid] = o2
