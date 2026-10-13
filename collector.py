@@ -885,6 +885,8 @@ def build_phone_bucket(md_orders):
             "catKey": fbkey(cat) if cat else "_no_cat", "catName": cat or "(без категорії)",
             "camp": "", "shop": shop, "approved": appr, "sold": sold, "refused": refused,
             "sum": total, "upsSum": 0.0, "upsCount": 0, "margin": gross, "drop": drop,
+            "pay": _paytype(str(m.get("description") or ""), str((m.get("orderStatus") or {}).get("title") or "")),
+            "depAmt": _deposit_amount(str(m.get("description") or "")),
             "items": items, "ext": ext, "phoneNum": phone_num, "phone": 1,
         }
     return out
@@ -1499,7 +1501,7 @@ def phone_only_run():
     1) ручные (web) заказы -> корзина «Телефон»; 2) дотягивает маржу сайтовым заказам из MyDrop.
     Ставится на каждые ~10 минут."""
     days = int(os.environ.get("PHONE_DAYS", "3"))
-    wdays = int(os.environ.get("WEBSITE_MARGIN_DAYS", "5"))
+    wdays = int(os.environ.get("WEBSITE_MARGIN_DAYS", "35"))   # покрываем весь текущий месяц: маржа + тип оплаты (задаток/оплачен) обновляются по актуальному статусу
     pages = int(os.environ.get("PHONE_MAX_PAGES", "120"))
     md = mydrop_fetch(max(days, wdays), pages)   # выборка покрывает и дни телефонных, и дни маржи
     print(f"phone-only: MyDrop заказов {len(md)}")
