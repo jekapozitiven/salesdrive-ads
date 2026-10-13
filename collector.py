@@ -438,6 +438,10 @@ def probe(resp):
 
 
 FIREBASE_DB_URL = os.environ.get("FIREBASE_DB_URL", "").strip().rstrip("/")
+# возвраты — опубликованная CSV Google-таблицы (вкладка «Возвраты 2026»).
+RETURNS_CSV_URL = os.environ.get("RETURNS_CSV_URL",
+    "https://docs.google.com/spreadsheets/d/e/2PACX-1vTgZgQQ39On4qJGlcUQleaKEoEPDmtJeG2ZavlkQwKZFA1bs74T4Fl9XqzkFVs4CmGSxjjv4dzlohHs/pub?gid=1149123774&single=true&output=csv")
+RETURNS_YEAR = int(os.environ.get("RETURNS_YEAR", "2026"))
 # статусы SalesDrive, которые считаем «апрув» (через запятую в секрете APRUV_STATUS).
 APRUV_STATUS = {s.strip() for s in os.environ.get("APRUV_STATUS", "").split(",") if s.strip()}
 MIXED_KEY = "__потребує_розподілу__"
@@ -531,10 +535,32 @@ def push_ads_firebase(agg):
     print(f"Firebase ads: записано дней {n} по {len(agg)} источникам")
 
 
+# ─── тип оплаты заказа (для статистики в «Звіти по магазинах») ──────────────
+# задаток — ловим по примечанию (description) с учётом опечаток; сумма — опционально.
+# полная оплата — по статусу MyDrop «Оплачен» (клиент оплатил заказ целиком).
+# иначе — обычный наложенный платёж.
+_DEPOSIT_RX = re.compile(r"зад[ао]т[оа]?к|zadat", re.I)          # задаток/задоток/задаток/zadatok
+_DEPOSIT_AMT_RX = re.compile(r"зад[а-яіїє]*[\s:\-]*?(\d{2,5})", re.I)
+
+def _paytype(desc, status_title):
+    """'deposit' | 'full' | 'cod' по примечанию и статусу MyDrop."""
+    d = desc or ""
+    if _DEPOSIT_RX.search(d):
+        return "deposit"
+    if "оплач" in (status_title or "").lower():   # статус «Оплачен» = полная оплата
+        return "full"
+    return "cod"
+
+def _deposit_amount(desc):
+    m = _DEPOSIT_AMT_RX.search(desc or "")
+    return int(m.group(1)) if m else 0
+
+
 def build_ord(orders, mbe=None, mbe_ph=None):
     """Пер-заказная детализация (навсегда): srckey -> day -> oid -> запись с товарами.
-    Запись: {catKey,catName,approved,sum,upsSum,upsCount,margin,drop,items,ext}.
-    items: [{sku,name,img,href,price}]. drop = продажна − маржа (по факту MyDrop)."""
+    Запись: {catKey,catName,approved,sum,upsSum,upsCount,margin,drop,items,ext,pay,depAmt}.
+    items: [{sku,name,img,href,price}]. drop = продажна − маржа (по факту MyDrop).
+    pay: 'deposit'/'full'/'cod' — тип оплаты (для статистики выкупа по группам)."""
     mbe = mbe or {}
     mbe_ph = mbe_ph or {}
     out = {}
@@ -586,16 +612,18 @@ def build_ord(orders, mbe=None, mbe_ph=None):
             approved = m.get("approved", 0); sold = m.get("sold", 0); refused = m.get("refused", 0)
             # продажна з MyDrop (total). Допрод лишаємо окремо: продажна(осн.) = total − допрод
             sale = round(max(_num(m.get("total")) - ups, 0.0), 2) or e["mainSum"]
+            pay = m.get("pay", "cod"); depAmt = m.get("depAmt", 0)   # тип оплаты (задаток/оплачен/наложенный)
         else:
             margin = ups; drop = 0.0; sold = 0; refused = 0   # без MyDrop: хотя бы допрод-маржа
             approved = 1 if str(x.get("statusId")) in APRUV_STATUS else 0
             sale = e["mainSum"]
+            pay = "cod"; depAmt = 0
         camp = camp_of(e["source"], [it.get("name") for it in items])
         out.setdefault(fbkey(e["source"]), {}).setdefault(day, {})[oid] = {
             "catKey": catkey, "catName": catname, "camp": camp,
             "approved": approved, "sold": sold, "refused": refused,
             "sum": sale, "upsSum": ups, "upsCount": 1 if e["upsells"] else 0,
-            "margin": margin, "drop": drop,
+            "margin": margin, "drop": drop, "pay": pay, "depAmt": depAmt,
             "items": items, "ext": str(e["externalId"] or ""),
         }
     return out
@@ -1052,8 +1080,12 @@ def _md_margin_info(m):
             drop = _num(m.get("dropPrice")); gross = round(total - drop, 2)
     else:
         gross = 0.0; drop = _num(m.get("dropPrice"))
+    st_title = str((m.get("orderStatus") or {}).get("title") or "")
+    desc = str(m.get("description") or "")
     return {"total": total, "drop": drop, "gross": gross,
-            "approved": appr, "sold": sold, "refused": refused, "hidden": _md_hidden(m)}
+            "approved": appr, "sold": sold, "refused": refused, "hidden": _md_hidden(m),
+            "pay": _paytype(desc, st_title), "depAmt": _deposit_amount(desc),
+            "prepay": _num(m.get("prepayAmount")), "delivPay": _num(m.get("deliveryPayment"))}
 
 
 def build_margin_phone_index(md_orders):
@@ -1401,7 +1433,8 @@ def update_website_margins(md_orders, days):
                 o2 = dict(o)
                 o2.update({"margin": round(m["gross"], 2),   # realMargin уже включает допрод — не прибавляем ups
                            "drop": m["drop"], "sum": sale,
-                           "approved": m["approved"], "sold": m["sold"], "refused": m["refused"]})
+                           "approved": m["approved"], "sold": m["sold"], "refused": m["refused"],
+                           "pay": m.get("pay", o.get("pay", "cod")), "depAmt": m.get("depAmt", o.get("depAmt", 0))})
                 upd[oid] = o2
             if upd:
                 requests.patch(url, data=json.dumps(upd, ensure_ascii=False).encode("utf-8"),
@@ -1411,6 +1444,54 @@ def update_website_margins(md_orders, days):
     print(f"update-margins: обновлено сайтовых заказов {patched}")
     if touched:
         reaggregate_ads_from_ord(touched)
+
+
+def _parse_ret_date(s):
+    """'06.01' / '09/01' / '10,01' -> '2026-01-06' (год = RETURNS_YEAR)."""
+    s = (s or "").strip().replace("/", ".").replace(",", ".")
+    m = re.match(r"^(\d{1,2})\.(\d{1,2})", s)
+    if not m:
+        return None
+    dd, mm = int(m.group(1)), int(m.group(2))
+    if not (1 <= dd <= 31 and 1 <= mm <= 12):
+        return None
+    return f"{RETURNS_YEAR:04d}-{mm:02d}-{dd:02d}"
+
+
+def fetch_returns():
+    """Читает опубликованную CSV возвратов и пишет в Firebase shop-reports/returns/<день> = {count,sum}.
+    Колонки: [тег, ФИО+ТТН, сумма НАМ, СУММА ВОЗВРАТА(3), ДАТА(4), карта, ...]."""
+    if not RETURNS_CSV_URL:
+        return
+    try:
+        import csv as _csv, io as _io
+        r = requests.get(RETURNS_CSV_URL, timeout=40)
+        if r.status_code != 200:
+            print(f"returns: HTTP {r.status_code}"); return
+        rows = list(_csv.reader(_io.StringIO(r.content.decode("utf-8", "replace"))))
+    except Exception as e:
+        print(f"returns fetch error: {e}"); return
+    agg = {}
+    for i, row in enumerate(rows):
+        if i == 0 or len(row) < 5:
+            continue
+        day = _parse_ret_date(row[4])
+        if not day:
+            continue
+        raw = re.sub(r"[^\d.]", "", str(row[3] or ""))
+        amt = float(raw) if raw else 0.0
+        cell = agg.setdefault(day, {"count": 0, "sum": 0.0})
+        cell["count"] += 1
+        cell["sum"] = round(cell["sum"] + amt, 2)
+    if FIREBASE_DB_URL and agg is not None:
+        try:
+            requests.put(f"{FIREBASE_DB_URL}/shop-reports/returns.json",
+                         data=json.dumps(agg, ensure_ascii=False).encode("utf-8"),
+                         headers={"Content-Type": "application/json"}, timeout=60)
+            tot = sum(c["count"] for c in agg.values())
+            print(f"returns: записано дней {len(agg)}, всего возвратов {tot}")
+        except Exception as e:
+            print(f"returns push error: {e}")
 
 
 def phone_only_run():
@@ -1436,6 +1517,10 @@ def phone_only_run():
         update_website_margins(md, wdays)
     except Exception as e:
         print(f"update-margins: пропущено из-за ошибки: {e}")
+    try:
+        fetch_returns()   # возвраты из Google-таблицы -> Firebase (для «Звіти по магазинах»)
+    except Exception as e:
+        print(f"returns: пропущено из-за ошибки: {e}")
 
 
 def _phone_detail_debug(md_orders):
