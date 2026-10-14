@@ -1448,6 +1448,38 @@ def update_website_margins(md_orders, days):
         reaggregate_ads_from_ord(touched)
 
 
+def _status_histogram(md_orders):
+    """ДИАГНОСТИКА: гистограмма названий статусов MyDrop -> Firebase shop-reports/mydrop-status-debug.
+    Нужна, чтобы увидеть ТОЧНОЕ имя статуса «Оплачен» (для детекта полной оплаты)."""
+    if not FIREBASE_DB_URL:
+        return
+    hist = {}
+    desc_nonempty = 0
+    desc_deposit = 0
+    desc_samples = []
+    for m in md_orders:
+        t = str((m.get("orderStatus") or {}).get("title") or "—")
+        hist[t] = hist.get(t, 0) + 1
+        d = str(m.get("description") or "").strip()
+        if d:
+            desc_nonempty += 1
+            if _DEPOSIT_RX.search(d):
+                desc_deposit += 1
+                if len(desc_samples) < 10:
+                    desc_samples.append(d[:60])
+    try:
+        payload = {"at": dt.datetime.utcnow().isoformat(),
+                   "hist": dict(sorted(hist.items(), key=lambda kv: -kv[1])),
+                   "descNonEmpty": desc_nonempty, "descDeposit": desc_deposit,
+                   "depositSamples": desc_samples}
+        requests.put(f"{FIREBASE_DB_URL}/shop-reports/mydrop-status-debug.json",
+                     data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                     headers={"Content-Type": "application/json"}, timeout=40)
+        print(f"status-debug: статусов {len(hist)}")
+    except Exception as e:
+        print(f"status-debug: {e}")
+
+
 def _parse_ret_date(s):
     """'06.01' / '09/01' / '10,01' -> '2026-01-06' (год = RETURNS_YEAR)."""
     s = (s or "").strip().replace("/", ".").replace(",", ".")
@@ -1505,6 +1537,7 @@ def phone_only_run():
     pages = int(os.environ.get("PHONE_MAX_PAGES", "120"))
     md = mydrop_fetch(max(days, wdays), pages)   # выборка покрывает и дни телефонных, и дни маржи
     print(f"phone-only: MyDrop заказов {len(md)}")
+    _status_histogram(md)   # ДИАГНОСТИКА статусов (для детекта «Оплачен»)
     load_skucamp()   # чтобы категория/название тянулись как обычно (не обязательно, но пусть будет)
     tree = build_phone_bucket(md)
     n = sum(len(d) for s in tree.values() for d in s.values())
