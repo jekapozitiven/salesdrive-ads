@@ -1480,6 +1480,42 @@ def _status_histogram(md_orders):
         print(f"status-debug: {e}")
 
 
+def _detail_sample_debug(md_orders, n=45):
+    """ДИАГНОСТИКА: тянет детальные карточки первых N заказов и пишет цвет/примечание/поля оплаты
+    в Firebase shop-reports/mydrop-detail-debug — чтобы понять, как выглядят цветные/задаток-заказы."""
+    if not FIREBASE_DB_URL or not MYDROP_KEY:
+        return
+    headers = {"X-API-KEY": MYDROP_KEY, "Accept": "application/json"}
+    out = []
+    for m in md_orders[:n]:
+        oid = m.get("id")
+        if not oid:
+            continue
+        det = mydrop_detail(oid, headers) or {}
+        d = det.get("data") if isinstance(det.get("data"), dict) else det
+        if not isinstance(d, dict):
+            continue
+        cv = d.get("_cellVariants") or {}
+        cv_nonempty = {k: v for k, v in cv.items() if v} if isinstance(cv, dict) else cv
+        out.append({
+            "index": d.get("index"), "status": (d.get("orderStatus") or {}).get("title"),
+            "_rowVariant": d.get("_rowVariant"), "_cellVariants": cv_nonempty,
+            "prepayAmount": d.get("prepayAmount"), "fullPrepayAmount": d.get("fullPrepayAmount"),
+            "deliveryPayment": d.get("deliveryPayment"), "deliveryPaymentReceived": d.get("deliveryPaymentReceived"),
+            "total": d.get("total"),
+            "description": str(d.get("description") or "")[:70],
+            "privateDescription": str(d.get("privateDescription") or "")[:70],
+        })
+    try:
+        requests.put(f"{FIREBASE_DB_URL}/shop-reports/mydrop-detail-debug.json",
+                     data=json.dumps({"at": dt.datetime.utcnow().isoformat(), "samples": out},
+                                     ensure_ascii=False).encode("utf-8"),
+                     headers={"Content-Type": "application/json"}, timeout=60)
+        print(f"detail-debug: карточек {len(out)}")
+    except Exception as e:
+        print(f"detail-debug: {e}")
+
+
 def _parse_ret_date(s):
     """'06.01' / '09/01' / '10,01' -> '2026-01-06' (год = RETURNS_YEAR)."""
     s = (s or "").strip().replace("/", ".").replace(",", ".")
@@ -1538,6 +1574,7 @@ def phone_only_run():
     md = mydrop_fetch(max(days, wdays), pages)   # выборка покрывает и дни телефонных, и дни маржи
     print(f"phone-only: MyDrop заказов {len(md)}")
     _status_histogram(md)   # ДИАГНОСТИКА статусов (для детекта «Оплачен»)
+    _detail_sample_debug(md)   # ДИАГНОСТИКА: цвет строки + примечание + поля оплаты
     load_skucamp()   # чтобы категория/название тянулись как обычно (не обязательно, но пусть будет)
     tree = build_phone_bucket(md)
     n = sum(len(d) for s in tree.values() for d in s.values())
