@@ -1466,23 +1466,27 @@ def _status_histogram(md_orders):
     Нужна, чтобы увидеть ТОЧНОЕ имя статуса «Оплачен» (для детекта полной оплаты)."""
     if not FIREBASE_DB_URL:
         return
-    hist = {}
-    desc_nonempty = 0
-    desc_deposit = 0
-    desc_samples = []
-    for m in md_orders:
-        t = str((m.get("orderStatus") or {}).get("title") or "—")
-        hist[t] = hist.get(t, 0) + 1
-        d = str(m.get("description") or "").strip()
-        if d:
-            desc_nonempty += 1
-            if _DEPOSIT_RX.search(d):
-                desc_deposit += 1
-                if len(desc_samples) < 10:
-                    desc_samples.append(d[:60])
     try:
-        payload = {"at": dt.datetime.utcnow().isoformat(),
-                   "hist": dict(sorted(hist.items(), key=lambda kv: -kv[1])),
+        hist = {}
+        desc_nonempty = 0
+        desc_deposit = 0
+        desc_samples = []
+        for m in md_orders:
+            if not isinstance(m, dict):
+                continue
+            os_ = m.get("orderStatus")
+            t = str((os_.get("title") if isinstance(os_, dict) else os_) or "—")
+            hist[t] = hist.get(t, 0) + 1
+            d = str(m.get("description") or "").strip()
+            if d:
+                desc_nonempty += 1
+                if _DEPOSIT_RX.search(d):
+                    desc_deposit += 1
+                    if len(desc_samples) < 10:
+                        desc_samples.append(d[:60])
+        # hist как СПИСОК {title,count} — названия статусов могут содержать . / # $ [ ] (запрещены в ключах Firebase)
+        hist_list = [{"title": k, "count": v} for k, v in sorted(hist.items(), key=lambda kv: -kv[1])]
+        payload = {"at": dt.datetime.utcnow().isoformat(), "hist": hist_list,
                    "descNonEmpty": desc_nonempty, "descDeposit": desc_deposit,
                    "depositSamples": desc_samples}
         requests.put(f"{FIREBASE_DB_URL}/shop-reports/mydrop-status-debug.json",
@@ -1501,24 +1505,30 @@ def _detail_sample_debug(md_orders, n=45):
     headers = {"X-API-KEY": MYDROP_KEY, "Accept": "application/json"}
     out = []
     for m in md_orders[:n]:
-        oid = m.get("id")
-        if not oid:
+        try:
+            if not isinstance(m, dict):
+                continue
+            oid = m.get("id")
+            if not oid:
+                continue
+            det = mydrop_detail(oid, headers) or {}
+            d = det.get("data") if isinstance(det.get("data"), dict) else det
+            if not isinstance(d, dict):
+                continue
+            cv = d.get("_cellVariants") or {}
+            cv_nonempty = {str(k): v for k, v in cv.items() if v} if isinstance(cv, dict) else str(cv)
+            os_ = d.get("orderStatus")
+            out.append({
+                "index": d.get("index"), "status": (os_.get("title") if isinstance(os_, dict) else os_),
+                "_rowVariant": d.get("_rowVariant"), "_cellVariants": cv_nonempty,
+                "prepayAmount": d.get("prepayAmount"), "fullPrepayAmount": d.get("fullPrepayAmount"),
+                "deliveryPayment": d.get("deliveryPayment"), "deliveryPaymentReceived": d.get("deliveryPaymentReceived"),
+                "total": d.get("total"),
+                "description": str(d.get("description") or "")[:70],
+                "privateDescription": str(d.get("privateDescription") or "")[:70],
+            })
+        except Exception:
             continue
-        det = mydrop_detail(oid, headers) or {}
-        d = det.get("data") if isinstance(det.get("data"), dict) else det
-        if not isinstance(d, dict):
-            continue
-        cv = d.get("_cellVariants") or {}
-        cv_nonempty = {k: v for k, v in cv.items() if v} if isinstance(cv, dict) else cv
-        out.append({
-            "index": d.get("index"), "status": (d.get("orderStatus") or {}).get("title"),
-            "_rowVariant": d.get("_rowVariant"), "_cellVariants": cv_nonempty,
-            "prepayAmount": d.get("prepayAmount"), "fullPrepayAmount": d.get("fullPrepayAmount"),
-            "deliveryPayment": d.get("deliveryPayment"), "deliveryPaymentReceived": d.get("deliveryPaymentReceived"),
-            "total": d.get("total"),
-            "description": str(d.get("description") or "")[:70],
-            "privateDescription": str(d.get("privateDescription") or "")[:70],
-        })
     try:
         requests.put(f"{FIREBASE_DB_URL}/shop-reports/mydrop-detail-debug.json",
                      data=json.dumps({"at": dt.datetime.utcnow().isoformat(), "samples": out},
@@ -1586,9 +1596,12 @@ def phone_only_run():
     pages = int(os.environ.get("PHONE_MAX_PAGES", "120"))
     md = mydrop_fetch(max(days, wdays), pages)   # выборка покрывает и дни телефонных, и дни маржи
     print(f"phone-only: MyDrop заказов {len(md)}")
-    _collector_heartbeat("phone-only")   # пульс
-    _status_histogram(md)   # ДИАГНОСТИКА статусов (для детекта «Оплачен»)
-    _detail_sample_debug(md)   # ДИАГНОСТИКА: цвет строки + примечание + поля оплаты
+    try:
+        _collector_heartbeat("phone-only")   # пульс
+        _status_histogram(md)                 # ДИАГНОСТИКА статусов
+        _detail_sample_debug(md)              # ДИАГНОСТИКА: цвет строки + примечание
+    except Exception as e:
+        print(f"diag(phone): {e}")
     load_skucamp()   # чтобы категория/название тянулись как обычно (не обязательно, но пусть будет)
     tree = build_phone_bucket(md)
     n = sum(len(d) for s in tree.values() for d in s.values())
@@ -1671,9 +1684,12 @@ def main():
     if MYDROP_KEY:
         md = mydrop_fetch(DAYS)
         print(f"MyDrop: заказов {len(md)}")
-        _collector_heartbeat("ads-full")      # пульс: показывает, что идёт полный прогон
-        _status_histogram(md)                 # ДИАГНОСТИКА статусов (дублируем в полный прогон)
-        _detail_sample_debug(md)              # ДИАГНОСТИКА: цвет строки + примечание
+        try:
+            _collector_heartbeat("ads-full")  # пульс: идёт полный прогон
+            _status_histogram(md)             # ДИАГНОСТИКА статусов
+            _detail_sample_debug(md)          # ДИАГНОСТИКА: цвет строки + примечание
+        except Exception as e:
+            print(f"diag(ads): {e}")
         phone_debug(md)   # диагностика: какие заказы с «сайт» в примечании реально пришли из MyDrop
         mbe = build_margin_index(md)
         mbe_ph = build_margin_phone_index(md)
