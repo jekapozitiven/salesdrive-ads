@@ -1448,6 +1448,19 @@ def update_website_margins(md_orders, days):
         reaggregate_ads_from_ord(touched)
 
 
+def _collector_heartbeat(which):
+    """Пишет в Firebase, какой прогон и когда реально отработал (чтобы видеть, что крутится)."""
+    if not FIREBASE_DB_URL:
+        return
+    try:
+        requests.put(f"{FIREBASE_DB_URL}/shop-reports/collector-heartbeat.json",
+                     data=json.dumps({"at": dt.datetime.utcnow().isoformat(), "which": which},
+                                     ensure_ascii=False).encode("utf-8"),
+                     headers={"Content-Type": "application/json"}, timeout=30)
+    except Exception as e:
+        print(f"heartbeat: {e}")
+
+
 def _status_histogram(md_orders):
     """ДИАГНОСТИКА: гистограмма названий статусов MyDrop -> Firebase shop-reports/mydrop-status-debug.
     Нужна, чтобы увидеть ТОЧНОЕ имя статуса «Оплачен» (для детекта полной оплаты)."""
@@ -1569,10 +1582,11 @@ def phone_only_run():
     1) ручные (web) заказы -> корзина «Телефон»; 2) дотягивает маржу сайтовым заказам из MyDrop.
     Ставится на каждые ~10 минут."""
     days = int(os.environ.get("PHONE_DAYS", "3"))
-    wdays = int(os.environ.get("WEBSITE_MARGIN_DAYS", "35"))   # покрываем весь текущий месяц: маржа + тип оплаты (задаток/оплачен) обновляются по актуальному статусу
+    wdays = int(os.environ.get("WEBSITE_MARGIN_DAYS", "15"))   # окно обновления маржи/типа оплаты (дней). 35 мог ронять частый прогон — вернул к 15.
     pages = int(os.environ.get("PHONE_MAX_PAGES", "120"))
     md = mydrop_fetch(max(days, wdays), pages)   # выборка покрывает и дни телефонных, и дни маржи
     print(f"phone-only: MyDrop заказов {len(md)}")
+    _collector_heartbeat("phone-only")   # пульс
     _status_histogram(md)   # ДИАГНОСТИКА статусов (для детекта «Оплачен»)
     _detail_sample_debug(md)   # ДИАГНОСТИКА: цвет строки + примечание + поля оплаты
     load_skucamp()   # чтобы категория/название тянулись как обычно (не обязательно, но пусть будет)
@@ -1657,6 +1671,9 @@ def main():
     if MYDROP_KEY:
         md = mydrop_fetch(DAYS)
         print(f"MyDrop: заказов {len(md)}")
+        _collector_heartbeat("ads-full")      # пульс: показывает, что идёт полный прогон
+        _status_histogram(md)                 # ДИАГНОСТИКА статусов (дублируем в полный прогон)
+        _detail_sample_debug(md)              # ДИАГНОСТИКА: цвет строки + примечание
         phone_debug(md)   # диагностика: какие заказы с «сайт» в примечании реально пришли из MyDrop
         mbe = build_margin_index(md)
         mbe_ph = build_margin_phone_index(md)
