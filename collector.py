@@ -1459,19 +1459,21 @@ def write_catlists():
 
 def build_pay_detail_index(md_orders, cap=None):
     """Тип оплаты по ДЕТАЛЬНОЙ карточке -> {внешний_номер: (pay, depAmt)}.
-    Собираем заказы ЗА ВЕСЬ МЕСЯЦ кусками по 7 дней (MyDrop за один запрос отдаёт ограниченно),
-    поэтому ранние дни не обрезаются."""
+    С КЭШЕМ (shop-reports/ads-pay-cache по id): деталь тянем только для НОВЫХ и СВЕЖИХ заказов
+    (последние PAY_FRESH_DAYS дней — у них цвет/статус ещё меняется), старые берём из кэша.
+    Заказы месяца собираем кусками по 7 дней (MyDrop за раз отдаёт ограниченно)."""
     if not MYDROP_KEY:
         return {}
     from concurrent.futures import ThreadPoolExecutor
     cap = cap if cap is not None else int(os.environ.get("MD_PAY_CAP", "4000"))
-    pay_days = int(os.environ.get("PAY_DAYS", "32"))   # на сколько дней назад классифицировать оплату
+    pay_days = int(os.environ.get("PAY_DAYS", "20"))
+    fresh_days = int(os.environ.get("PAY_FRESH_DAYS", "6"))
     headers = {"X-API-KEY": MYDROP_KEY, "Accept": "application/json"}
-    # собираем id заказов кусками по 7 дней (чтобы MyDrop вернул все дни, а не только последние ~1000)
-    id_set = {}
     today = dt.date.today()
-    step = 7
-    off = 0
+    fresh_cutoff = (today - dt.timedelta(days=fresh_days)).isoformat()
+    # собрать id+дату заказов месяца кусками по 7 дней (это лёгкие list-запросы, без деталей)
+    id_date = {}
+    off, step = 0, 7
     while off < pay_days:
         d_end = today - dt.timedelta(days=off)
         d_start = today - dt.timedelta(days=min(off + step - 1, pay_days))
@@ -1481,20 +1483,18 @@ def build_pay_detail_index(md_orders, cap=None):
             print(f"pay-detail chunk {d_start}..{d_end}: {e}"); chunk = []
         for m in chunk:
             if isinstance(m, dict) and m.get("id"):
-                id_set[str(m.get("id"))] = True
+                id_date[str(m.get("id"))] = str(m.get("dateTime") or m.get("date") or "")[:10]
         off += step
-    ids = list(id_set.keys())[:cap]
-    print(f"pay-detail: заказов за {pay_days} дн. собрано {len(id_set)}, беру {len(ids)}")
-
-    dep_fields = {}   # ДИАГНОСТИКА: в каком поле детали встречается «задаток»
-
-    def _scan_deposit(d, path=""):
-        if isinstance(d, dict):
-            for k, v in d.items():
-                _scan_deposit(v, (path + "." + str(k)) if path else str(k))
-        elif isinstance(d, str) and _DEPOSIT_RX.search(d):
-            if len(dep_fields) < 25:
-                dep_fields[path] = d[:70]
+    # кэш классификаций {id: {ext, pay, dep}}
+    cache = {}
+    try:
+        cache = requests.get(f"{FIREBASE_DB_URL}/shop-reports/ads-pay-cache.json", timeout=40).json() or {}
+    except Exception:
+        cache = {}
+    # деталь тянем только для: новых (нет в кэше) ИЛИ свежих (дата >= cutoff — цвет/статус ещё меняется)
+    todo = [mid for mid, day in id_date.items() if (mid not in cache) or (day and day >= fresh_cutoff)]
+    todo = todo[:cap]
+    print(f"pay-detail: месяц {len(id_date)} заказов, в кэше {len(cache)}, тянем деталь {len(todo)}")
 
     def work(mid):
         try:
@@ -1502,28 +1502,33 @@ def build_pay_detail_index(md_orders, cap=None):
             d = det.get("data") if isinstance(det.get("data"), dict) else det
             if not isinstance(d, dict):
                 return None
-            _scan_deposit(d)
             ext = _extnum({"data": d})
             if not ext:
                 return None
             pay, dep = _pay_from_detail(d)
-            return (ext, pay, dep)
+            return (mid, ext, pay, dep)
         except Exception:
             return None
-    out = {}
+    new_cache = {}
     with ThreadPoolExecutor(max_workers=10) as ex:
-        for r in ex.map(work, ids):
+        for r in ex.map(work, todo):
             if r:
-                out[r[0]] = (r[1], r[2])
-    print(f"pay-detail: классифицировано по детали {len(out)} заказов")
-    if FIREBASE_DB_URL:
+                new_cache[r[0]] = {"ext": r[1], "pay": r[2], "dep": r[3]}
+    cache.update(new_cache)
+    if FIREBASE_DB_URL and new_cache:
         try:
-            requests.put(f"{FIREBASE_DB_URL}/shop-reports/mydrop-deposit-fields.json",
-                         data=json.dumps({"at": dt.datetime.utcnow().isoformat(), "fields": dep_fields},
-                                         ensure_ascii=False).encode("utf-8"),
-                         headers={"Content-Type": "application/json"}, timeout=40)
+            requests.patch(f"{FIREBASE_DB_URL}/shop-reports/ads-pay-cache.json",
+                           data=json.dumps(new_cache, ensure_ascii=False).encode("utf-8"),
+                           headers={"Content-Type": "application/json"}, timeout=60)
         except Exception as e:
-            print(f"deposit-fields: {e}")
+            print(f"pay-cache: {e}")
+    # собрать pay_idx по всем заказам месяца (из кэша)
+    out = {}
+    for mid in id_date:
+        c = cache.get(mid)
+        if c and c.get("ext"):
+            out[c["ext"]] = (c.get("pay", "cod"), c.get("dep", 0))
+    print(f"pay-detail: pay_idx готов на {len(out)} заказов")
     return out
 
 
