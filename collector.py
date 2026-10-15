@@ -1505,6 +1505,11 @@ def _detail_sample_debug(md_orders, n=24):
     from concurrent.futures import ThreadPoolExecutor
     headers = {"X-API-KEY": MYDROP_KEY, "Accept": "application/json"}
     ids = [m.get("id") for m in md_orders[:n] if isinstance(m, dict) and m.get("id")]
+    # явно добавим примеры-заказы (по CRM-номеру index), чтобы увидеть их примечание/предоплату
+    targets = {"433258688", "433509401", "429895230"}
+    for m in md_orders:
+        if isinstance(m, dict) and str(m.get("index")) in targets and m.get("id") not in ids:
+            ids.append(m.get("id"))
 
     def one(oid):
         try:
