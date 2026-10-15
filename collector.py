@@ -1432,7 +1432,58 @@ def write_catlists():
     print("Майстер-список категорій: " + ", ".join(f"{k.split('-')[-1]}={len(v)}" for k, v in out.items()))
 
 
-def update_website_margins(md_orders, days):
+def build_pay_detail_index(md_orders, cap=None):
+    """Тип оплаты по ДЕТАЛЬНОЙ карточке для свежих заказов -> {внешний_номер: (pay, depAmt)}.
+    Ограничен (cap), чтобы не перегружать MyDrop и не ронять прогон. Свежие заказы = начало списка."""
+    if not MYDROP_KEY:
+        return {}
+    from concurrent.futures import ThreadPoolExecutor
+    cap = cap if cap is not None else int(os.environ.get("MD_PAY_CAP", "1600"))   # покрыть весь текущий месяц
+    headers = {"X-API-KEY": MYDROP_KEY, "Accept": "application/json"}
+    ids = [m.get("id") for m in md_orders[:cap] if isinstance(m, dict) and m.get("id")]
+
+    dep_fields = {}   # ДИАГНОСТИКА: в каком поле детали встречается «задаток»
+
+    def _scan_deposit(d, path=""):
+        if isinstance(d, dict):
+            for k, v in d.items():
+                _scan_deposit(v, (path + "." + str(k)) if path else str(k))
+        elif isinstance(d, str) and _DEPOSIT_RX.search(d):
+            if len(dep_fields) < 25:
+                dep_fields[path] = d[:70]
+
+    def work(mid):
+        try:
+            det = mydrop_detail(mid, headers) or {}
+            d = det.get("data") if isinstance(det.get("data"), dict) else det
+            if not isinstance(d, dict):
+                return None
+            _scan_deposit(d)
+            ext = _extnum({"data": d})
+            if not ext:
+                return None
+            pay, dep = _pay_from_detail(d)
+            return (ext, pay, dep)
+        except Exception:
+            return None
+    out = {}
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        for r in ex.map(work, ids):
+            if r:
+                out[r[0]] = (r[1], r[2])
+    print(f"pay-detail: классифицировано по детали {len(out)} заказов")
+    if FIREBASE_DB_URL:
+        try:
+            requests.put(f"{FIREBASE_DB_URL}/shop-reports/mydrop-deposit-fields.json",
+                         data=json.dumps({"at": dt.datetime.utcnow().isoformat(), "fields": dep_fields},
+                                         ensure_ascii=False).encode("utf-8"),
+                         headers={"Content-Type": "application/json"}, timeout=40)
+        except Exception as e:
+            print(f"deposit-fields: {e}")
+    return out
+
+
+def update_website_margins(md_orders, days, pay_idx=None):
     """MyDrop-only обновление маржи сайтовых заказов (без SalesDrive). Матч по номеру заказа (ext).
     Проставляет margin/drop/продажну уже существующим заказам ads-ord за последние `days` дней,
     чтобы у свежих заказов маржа дотягивалась быстро, не завися от квоты SalesDrive."""
@@ -1468,10 +1519,14 @@ def update_website_margins(md_orders, days):
                 ups = _num(o.get("upsSum"))
                 sale = round(max(_num(m.get("total")) - ups, 0.0), 2) or o.get("sum")
                 o2 = dict(o)
+                ext = str(o.get("ext") or "")
+                pd = (pay_idx or {}).get(ext)   # деталь: (pay, depAmt) — приоритетнее списочного
+                pay_val = pd[0] if pd else m.get("pay", "cod")
+                dep_val = pd[1] if pd else m.get("depAmt", 0)
                 o2.update({"margin": round(m["gross"], 2),   # realMargin уже включает допрод — не прибавляем ups
                            "drop": m["drop"], "sum": sale,
                            "approved": m["approved"], "sold": m["sold"], "refused": m["refused"],
-                           "pay": m.get("pay", "cod"), "depAmt": m.get("depAmt", 0)})
+                           "pay": pay_val, "depAmt": dep_val})
                 upd[oid] = o2
             if upd:
                 requests.patch(url, data=json.dumps(upd, ensure_ascii=False).encode("utf-8"),
@@ -1674,9 +1729,14 @@ def phone_only_run():
     print(f"phone-only: MyDrop заказов {len(md)}")
     try:
         _collector_heartbeat("phone-only")
-        _probe_examples(md)   # крошечная проверка 3 примеров (задаток/предоплата/цвет)
     except Exception as e:
         print(f"diag(phone): {e}")
+    # тип оплаты по ДЕТАЛИ (задаток по примечанию/приватному, полная — цвет/предоплата) для свежих заказов
+    pay_idx = {}
+    try:
+        pay_idx = build_pay_detail_index(md)
+    except Exception as e:
+        print(f"pay-detail: {e}")
     load_skucamp()   # чтобы категория/название тянулись как обычно (не обязательно, но пусть будет)
     tree = build_phone_bucket(md)
     n = sum(len(d) for s in tree.values() for d in s.values())
@@ -1688,7 +1748,7 @@ def phone_only_run():
     # Оборачиваем: если MyDrop/Firebase подвисли на этом тяжёлом шаге — не роняем весь прогон,
     # телефонные заказы уже записаны, маржа дотянется на следующем запуске.
     try:
-        update_website_margins(md, wdays)
+        update_website_margins(md, wdays, pay_idx)
     except Exception as e:
         print(f"update-margins: пропущено из-за ошибки: {e}")
     try:
