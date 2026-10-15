@@ -1462,7 +1462,7 @@ def build_pay_detail_index(md_orders, cap=None):
     if not MYDROP_KEY:
         return {}
     from concurrent.futures import ThreadPoolExecutor
-    cap = cap if cap is not None else int(os.environ.get("MD_PAY_CAP", "1600"))   # покрыть весь текущий месяц
+    cap = cap if cap is not None else int(os.environ.get("MD_PAY_CAP", "3000"))   # покрыть весь текущий месяц (старые дни не обрезать)
     headers = {"X-API-KEY": MYDROP_KEY, "Accept": "application/json"}
     ids = [m.get("id") for m in md_orders[:cap] if isinstance(m, dict) and m.get("id")]
 
