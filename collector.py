@@ -556,6 +556,28 @@ def _deposit_amount(desc):
     return int(m.group(1)) if m else 0
 
 
+# цвета строки MyDrop, которыми отмечают ПОЛНУЮ ОПЛАТУ (жёлтый=warning, красный=danger)
+_FULL_ROW_COLORS = {"warning", "danger", "success", "info"}
+
+def _pay_from_detail(d, list_order=None):
+    """Тип оплаты по ДЕТАЛЬНОЙ карточке MyDrop. Возвращает (pay, depAmt).
+    Приоритеты:
+      1) ЗАДАТОК — только по примечанию (description + privateDescription), с учётом опечаток;
+      2) ПОЛНАЯ ОПЛАТА — жёлтый/красный цвет строки (_rowVariant) ИЛИ заполнено поле «Предоплата»;
+      3) иначе — накладений платіж."""
+    d = d or {}
+    note = " | ".join([str(d.get("description") or ""), str(d.get("privateDescription") or "")])
+    if (not note.strip() or note == " | ") and isinstance(list_order, dict):
+        note = str(list_order.get("description") or "")
+    if _DEPOSIT_RX.search(note):
+        return "deposit", _deposit_amount(note)
+    rv = str(d.get("_rowVariant") or "").strip().lower()
+    prepay = _num(d.get("prepayAmount")) + _num(d.get("fullPrepayAmount"))
+    if rv in _FULL_ROW_COLORS or prepay > 0:
+        return "full", 0
+    return "cod", 0
+
+
 def build_ord(orders, mbe=None, mbe_ph=None):
     """Пер-заказная детализация (навсегда): srckey -> day -> oid -> запись с товарами.
     Запись: {catKey,catName,approved,sum,upsSum,upsCount,margin,drop,items,ext,pay,depAmt}.
@@ -885,8 +907,7 @@ def build_phone_bucket(md_orders):
             "catKey": fbkey(cat) if cat else "_no_cat", "catName": cat or "(без категорії)",
             "camp": "", "shop": shop, "approved": appr, "sold": sold, "refused": refused,
             "sum": total, "upsSum": 0.0, "upsCount": 0, "margin": gross, "drop": drop,
-            "pay": _paytype(str(m.get("description") or ""), str((m.get("orderStatus") or {}).get("title") or "")),
-            "depAmt": _deposit_amount(str(m.get("description") or "")),
+            "pay": _pay_from_detail(dd, m)[0], "depAmt": _pay_from_detail(dd, m)[1],
             "items": items, "ext": ext, "phoneNum": phone_num, "phone": 1,
         }
     return out
@@ -1102,9 +1123,10 @@ def build_margin_phone_index(md_orders):
     return idx
 
 
-def build_margin_index(md_orders):
-    """Строит {внешний_номер: маржа}. Кэш id->внешний_номер в Firebase (тянем карточки
-    только для новых заказов, маржу берём из списка — она дозревает)."""
+def build_margin_index(md_orders, with_pay=False):
+    """Строит {внешний_номер: инфо-маржи}. Кэш id->внешний_номер в Firebase.
+    with_pay=True: ДОПОЛНИТЕЛЬНО тянет детальную карточку КАЖДОГО заказа и проставляет тип оплаты
+    (задаток по примечанию, полная оплата по цвету строки / полю «Предоплата»). Тяжело — только в полном прогоне."""
     from concurrent.futures import ThreadPoolExecutor
     headers = {"X-API-KEY": MYDROP_KEY, "Accept": "application/json"}
     cache = {}
@@ -1116,21 +1138,26 @@ def build_margin_index(md_orders):
         except Exception:
             pass
     ids = [str(m.get("id")) for m in md_orders if m.get("id")]
-    missing = [i for i in ids if i not in cache]
-    cap = int(os.environ.get("MD_DETAIL_CAP", "700"))
-    missing = missing[:cap]
-    print(f"MyDrop-индекс: заказов {len(ids)}, в кэше {len(ids) - len([i for i in ids if i not in cache])}, "
-          f"дотягиваю карточек {len(missing)}")
-    if missing:
-        def work(i):
-            return i, _extnum(mydrop_detail(i, headers))
-        new = {}
+    details = {}          # id -> детальная карточка (для типа оплаты), если with_pay
+    if with_pay:
+        cap = int(os.environ.get("MD_PAY_CAP", "2000"))
+        fetch_ids = ids[:cap]
+        print(f"MyDrop-индекс+оплата: тяну детали {len(fetch_ids)} заказов (для задатка/оплаты)")
+
+        def workd(i):
+            det = mydrop_detail(i, headers) or {}
+            dd = det.get("data") if isinstance(det.get("data"), dict) else det
+            return i, (dd if isinstance(dd, dict) else None)
         with ThreadPoolExecutor(max_workers=10) as ex:
-            for i, ext in ex.map(work, missing):
-                if ext:                       # кэшируем только удачные; пустые перепробуем позже
-                    cache[i] = ext
-                    new[i] = ext
-        print(f"  новых номеров закэшировано: {len(new)}")
+            for i, dd in ex.map(workd, fetch_ids):
+                if dd is not None:
+                    details[i] = dd
+        # обновим кэш внешних номеров из этих же деталей
+        new = {}
+        for i, dd in details.items():
+            ext = _extnum({"data": dd})
+            if ext and cache.get(i) != ext:
+                cache[i] = ext; new[i] = ext
         if FIREBASE_DB_URL and new:
             try:
                 requests.patch(f"{FIREBASE_DB_URL}/shop-reports/ads-md-index.json",
@@ -1138,11 +1165,39 @@ def build_margin_index(md_orders):
                                headers={"Content-Type": "application/json"}, timeout=60)
             except Exception as e:
                 print(f"кэш индекса не сохранён: {e}")
+    else:
+        missing = [i for i in ids if i not in cache]
+        cap = int(os.environ.get("MD_DETAIL_CAP", "700"))
+        missing = missing[:cap]
+        print(f"MyDrop-индекс: заказов {len(ids)}, в кэше {len(ids) - len(missing)}, дотягиваю карточек {len(missing)}")
+        if missing:
+            def work(i):
+                return i, _extnum(mydrop_detail(i, headers))
+            new = {}
+            with ThreadPoolExecutor(max_workers=10) as ex:
+                for i, ext in ex.map(work, missing):
+                    if ext:
+                        cache[i] = ext; new[i] = ext
+            print(f"  новых номеров закэшировано: {len(new)}")
+            if FIREBASE_DB_URL and new:
+                try:
+                    requests.patch(f"{FIREBASE_DB_URL}/shop-reports/ads-md-index.json",
+                                   data=json.dumps(new, ensure_ascii=False).encode("utf-8"),
+                                   headers={"Content-Type": "application/json"}, timeout=60)
+                except Exception as e:
+                    print(f"кэш индекса не сохранён: {e}")
     mbe = {}
     for m in md_orders:
-        ext = cache.get(str(m.get("id")))
-        if ext:
-            mbe[ext] = _md_margin_info(m)
+        mid = str(m.get("id"))
+        ext = cache.get(mid)
+        if not ext:
+            continue
+        info = _md_margin_info(m)
+        if with_pay:
+            pay, dep = _pay_from_detail(details.get(mid), m)
+            info["pay"] = pay
+            info["depAmt"] = dep
+        mbe[ext] = info
     return mbe
 
 
@@ -1433,10 +1488,11 @@ def update_website_margins(md_orders, days):
                 ups = _num(o.get("upsSum"))
                 sale = round(max(_num(m.get("total")) - ups, 0.0), 2) or o.get("sum")
                 o2 = dict(o)
+                # pay/depAmt НЕ трогаем — их проставляет полный прогон по детали (задаток/оплата по цвету);
+                # здесь только маржа/статусы, чтобы частый прогон не перетирал тип оплаты списочным «cod».
                 o2.update({"margin": round(m["gross"], 2),   # realMargin уже включает допрод — не прибавляем ups
                            "drop": m["drop"], "sum": sale,
-                           "approved": m["approved"], "sold": m["sold"], "refused": m["refused"],
-                           "pay": m.get("pay", o.get("pay", "cod")), "depAmt": m.get("depAmt", o.get("depAmt", 0))})
+                           "approved": m["approved"], "sold": m["sold"], "refused": m["refused"]})
                 upd[oid] = o2
             if upd:
                 requests.patch(url, data=json.dumps(upd, ensure_ascii=False).encode("utf-8"),
@@ -1604,9 +1660,7 @@ def phone_only_run():
     md = mydrop_fetch(max(days, wdays), pages)   # выборка покрывает и дни телефонных, и дни маржи
     print(f"phone-only: MyDrop заказов {len(md)}")
     try:
-        _collector_heartbeat("phone-only")   # пульс
-        _status_histogram(md)                 # ДИАГНОСТИКА статусов
-        _detail_sample_debug(md)              # ДИАГНОСТИКА: цвет строки + примечание
+        _collector_heartbeat("phone-only")
     except Exception as e:
         print(f"diag(phone): {e}")
     load_skucamp()   # чтобы категория/название тянулись как обычно (не обязательно, но пусть будет)
@@ -1693,12 +1747,11 @@ def main():
         print(f"MyDrop: заказов {len(md)}")
         try:
             _collector_heartbeat("ads-full")  # пульс: идёт полный прогон
-            _status_histogram(md)             # ДИАГНОСТИКА статусов
-            _detail_sample_debug(md)          # ДИАГНОСТИКА: цвет строки + примечание
+            _status_histogram(md)             # лёгкая диагностика статусов (список) — пусть будет
         except Exception as e:
             print(f"diag(ads): {e}")
         phone_debug(md)   # диагностика: какие заказы с «сайт» в примечании реально пришли из MyDrop
-        mbe = build_margin_index(md)
+        mbe = build_margin_index(md, with_pay=True)   # полный прогон: тип оплаты по детали (задаток/оплата)
         mbe_ph = build_margin_phone_index(md)
         site = [extract(x) for x in orders]
         site = [e for e in site if e["source"] in WANTED_SOURCES]
