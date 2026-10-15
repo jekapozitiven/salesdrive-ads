@@ -1030,19 +1030,20 @@ MARGIN_KEYS = ("realMargin", "margin", "real_margin")
 MD_MAX_PAGES = int(os.environ.get("MD_MAX_PAGES", "500"))
 
 
-def mydrop_fetch(days, max_pages=None):
-    """Заказы MyDrop за последние `days` дней (для джойна по внешнему номеру)."""
+def mydrop_fetch(days, max_pages=None, date_start=None, date_end=None):
+    """Заказы MyDrop за период. По умолчанию — последние `days` дней; можно задать явный date_start/date_end."""
     if max_pages is None:
         max_pages = MD_MAX_PAGES
     if not MYDROP_KEY:
         print("Нет MYDROP_API_KEY — MyDrop пропускаю.")
         return []
     headers = {"X-API-KEY": MYDROP_KEY, "Accept": "application/json"}
-    date_from = (dt.date.today() - dt.timedelta(days=days)).isoformat()
+    date_from = date_start or (dt.date.today() - dt.timedelta(days=days)).isoformat()
+    date_to = date_end or dt.date.today().isoformat()
     out, page = [], 1
     while page <= max_pages:
         params = {"date_type": "period", "date_start": date_from,
-                  "date_end": dt.date.today().isoformat(), "page": page}
+                  "date_end": date_to, "page": page}
         r = None
         for attempt in range(1, 6):
             try:
@@ -1457,14 +1458,33 @@ def write_catlists():
 
 
 def build_pay_detail_index(md_orders, cap=None):
-    """Тип оплаты по ДЕТАЛЬНОЙ карточке для свежих заказов -> {внешний_номер: (pay, depAmt)}.
-    Ограничен (cap), чтобы не перегружать MyDrop и не ронять прогон. Свежие заказы = начало списка."""
+    """Тип оплаты по ДЕТАЛЬНОЙ карточке -> {внешний_номер: (pay, depAmt)}.
+    Собираем заказы ЗА ВЕСЬ МЕСЯЦ кусками по 7 дней (MyDrop за один запрос отдаёт ограниченно),
+    поэтому ранние дни не обрезаются."""
     if not MYDROP_KEY:
         return {}
     from concurrent.futures import ThreadPoolExecutor
-    cap = cap if cap is not None else int(os.environ.get("MD_PAY_CAP", "3000"))   # покрыть весь текущий месяц (старые дни не обрезать)
+    cap = cap if cap is not None else int(os.environ.get("MD_PAY_CAP", "4000"))
+    pay_days = int(os.environ.get("PAY_DAYS", "32"))   # на сколько дней назад классифицировать оплату
     headers = {"X-API-KEY": MYDROP_KEY, "Accept": "application/json"}
-    ids = [m.get("id") for m in md_orders[:cap] if isinstance(m, dict) and m.get("id")]
+    # собираем id заказов кусками по 7 дней (чтобы MyDrop вернул все дни, а не только последние ~1000)
+    id_set = {}
+    today = dt.date.today()
+    step = 7
+    off = 0
+    while off < pay_days:
+        d_end = today - dt.timedelta(days=off)
+        d_start = today - dt.timedelta(days=min(off + step - 1, pay_days))
+        try:
+            chunk = mydrop_fetch(0, date_start=d_start.isoformat(), date_end=d_end.isoformat())
+        except Exception as e:
+            print(f"pay-detail chunk {d_start}..{d_end}: {e}"); chunk = []
+        for m in chunk:
+            if isinstance(m, dict) and m.get("id"):
+                id_set[str(m.get("id"))] = True
+        off += step
+    ids = list(id_set.keys())[:cap]
+    print(f"pay-detail: заказов за {pay_days} дн. собрано {len(id_set)}, беру {len(ids)}")
 
     dep_fields = {}   # ДИАГНОСТИКА: в каком поле детали встречается «задаток»
 
