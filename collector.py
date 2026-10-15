@@ -598,13 +598,14 @@ def _pay_from_detail(d, list_order=None):
     return "cod", 0
 
 
-def build_ord(orders, mbe=None, mbe_ph=None):
+def build_ord(orders, mbe=None, mbe_ph=None, pay_idx=None):
     """Пер-заказная детализация (навсегда): srckey -> day -> oid -> запись с товарами.
     Запись: {catKey,catName,approved,sum,upsSum,upsCount,margin,drop,items,ext,pay,depAmt}.
     items: [{sku,name,img,href,price}]. drop = продажна − маржа (по факту MyDrop).
-    pay: 'deposit'/'full'/'cod' — тип оплаты (для статистики выкупа по группам)."""
+    pay: 'deposit'/'full'/'cod' — тип оплаты. pay_idx {ext:(pay,depAmt)} из детали приоритетнее."""
     mbe = mbe or {}
     mbe_ph = mbe_ph or {}
+    pay_idx = pay_idx or {}
     out = {}
     for x in orders:
         e = extract(x)
@@ -660,6 +661,9 @@ def build_ord(orders, mbe=None, mbe_ph=None):
             approved = 1 if str(x.get("statusId")) in APRUV_STATUS else 0
             sale = e["mainSum"]
             pay = "cod"; depAmt = 0
+        pd = pay_idx.get(str(e["externalId"] or ""))   # деталь (задаток/оплата по цвету/примечанию) приоритетнее
+        if pd:
+            pay, depAmt = pd[0], pd[1]
         camp = camp_of(e["source"], [it.get("name") for it in items])
         out.setdefault(fbkey(e["source"]), {}).setdefault(day, {})[oid] = {
             "catKey": catkey, "catName": catname, "camp": camp,
@@ -1835,6 +1839,7 @@ def main():
     # маржа из MyDrop по внешнему номеру (если задан ключ)
     mbe = {}
     mbe_ph = {}
+    pay_idx = {}
     md = []
     if MYDROP_KEY:
         md = mydrop_fetch(DAYS)
@@ -1845,8 +1850,12 @@ def main():
         except Exception as e:
             print(f"diag(ads): {e}")
         phone_debug(md)   # диагностика: какие заказы с «сайт» в примечании реально пришли из MyDrop
-        mbe = build_margin_index(md, with_pay=True)   # полный прогон: тип оплаты по детали (задаток/оплата)
+        mbe = build_margin_index(md)
         mbe_ph = build_margin_phone_index(md)
+        try:
+            pay_idx = build_pay_detail_index(md)   # тип оплаты по детали (задаток/оплата по цвету) за весь месяц
+        except Exception as e:
+            print(f"pay-detail(ads): {e}"); pay_idx = {}
         site = [extract(x) for x in orders]
         site = [e for e in site if e["source"] in WANTED_SOURCES]
         cov = sum(1 for e in site if str(e["externalId"]) in mbe)
@@ -1881,7 +1890,7 @@ def main():
     # поордерная детализация (товары, дроп, маржа) — постоянная история;
     # ads собираем ИЗ ads-ord, чтобы учитывались и телефонные заказы из MyDrop.
     try:
-        ordtree = build_ord(orders, mbe, mbe_ph)
+        ordtree = build_ord(orders, mbe, mbe_ph, pay_idx)
         # все ручные (web) заказы MyDrop -> корзина «Телефон» (магазин/кампанию назначают вручную)
         phone_tree = build_phone_bucket(md)
         nph = 0
