@@ -539,8 +539,8 @@ def push_ads_firebase(agg):
 # задаток — ловим по примечанию (description) с учётом опечаток; сумма — опционально.
 # полная оплата — по статусу MyDrop «Оплачен» (клиент оплатил заказ целиком).
 # иначе — обычный наложенный платёж.
-_DEPOSIT_RX = re.compile(r"зад[ао]т[оа]?к|zadat", re.I)          # задаток/задоток/задаток/zadatok
-_DEPOSIT_AMT_RX = re.compile(r"зад[а-яіїє]*[\s:\-]*?(\d{2,5})", re.I)
+_DEPOSIT_RX = re.compile(r"за[вй]?д[ао]т[оа]?к|zav?datok", re.I)  # задаток/завдаток/задоток/zadatok/zavdatok (вкл. опечатки)
+_DEPOSIT_AMT_RX = re.compile(r"за[вй]?д[а-яіїє]*[\s:\-]*?(\d{2,5})", re.I)
 
 def _paytype(desc, status_title):
     """'deposit' | 'full' | 'cod' по примечанию и статусу MyDrop."""
@@ -559,6 +559,25 @@ def _deposit_amount(desc):
 # цвета строки MyDrop, которыми отмечают ПОЛНУЮ ОПЛАТУ (жёлтый=warning, красный=danger)
 _FULL_ROW_COLORS = {"warning", "danger", "success", "info"}
 
+def _find_deposit_note(obj, depth=0):
+    """Рекурсивно ищет «задаток/завдаток» в любом строковом поле (до глубины 4). Возвращает текст или None."""
+    if depth > 4:
+        return None
+    if isinstance(obj, str):
+        return obj if _DEPOSIT_RX.search(obj) else None
+    if isinstance(obj, dict):
+        for v in obj.values():
+            r = _find_deposit_note(v, depth + 1)
+            if r:
+                return r
+    elif isinstance(obj, list):
+        for v in obj:
+            r = _find_deposit_note(v, depth + 1)
+            if r:
+                return r
+    return None
+
+
 def _pay_from_detail(d, list_order=None):
     """Тип оплаты по ДЕТАЛЬНОЙ карточке MyDrop. Возвращает (pay, depAmt).
     Приоритеты:
@@ -566,11 +585,12 @@ def _pay_from_detail(d, list_order=None):
       2) ПОЛНАЯ ОПЛАТА — жёлтый/красный цвет строки (_rowVariant) ИЛИ заполнено поле «Предоплата»;
       3) иначе — накладений платіж."""
     d = d or {}
-    note = " | ".join([str(d.get("description") or ""), str(d.get("privateDescription") or "")])
-    if (not note.strip() or note == " | ") and isinstance(list_order, dict):
-        note = str(list_order.get("description") or "")
-    if _DEPOSIT_RX.search(note):
-        return "deposit", _deposit_amount(note)
+    # задаток/завдаток — ищем по ВСЕМ строковым полям карточки (примечание может быть в любом поле)
+    dep_hit = _find_deposit_note(d)
+    if not dep_hit and isinstance(list_order, dict):
+        dep_hit = _find_deposit_note(list_order)
+    if dep_hit:
+        return "deposit", _deposit_amount(dep_hit)
     rv = str(d.get("_rowVariant") or "").strip().lower()
     prepay = _num(d.get("prepayAmount")) + _num(d.get("fullPrepayAmount"))
     if rv in _FULL_ROW_COLORS or prepay > 0:
