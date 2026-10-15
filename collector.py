@@ -1497,28 +1497,25 @@ def _status_histogram(md_orders):
         print(f"status-debug: {e}")
 
 
-def _detail_sample_debug(md_orders, n=45):
-    """ДИАГНОСТИКА: тянет детальные карточки первых N заказов и пишет цвет/примечание/поля оплаты
+def _detail_sample_debug(md_orders, n=24):
+    """ДИАГНОСТИКА: тянет детальные карточки N заказов (параллельно) и пишет цвет/примечание/поля оплаты
     в Firebase shop-reports/mydrop-detail-debug — чтобы понять, как выглядят цветные/задаток-заказы."""
     if not FIREBASE_DB_URL or not MYDROP_KEY:
         return
+    from concurrent.futures import ThreadPoolExecutor
     headers = {"X-API-KEY": MYDROP_KEY, "Accept": "application/json"}
-    out = []
-    for m in md_orders[:n]:
+    ids = [m.get("id") for m in md_orders[:n] if isinstance(m, dict) and m.get("id")]
+
+    def one(oid):
         try:
-            if not isinstance(m, dict):
-                continue
-            oid = m.get("id")
-            if not oid:
-                continue
             det = mydrop_detail(oid, headers) or {}
             d = det.get("data") if isinstance(det.get("data"), dict) else det
             if not isinstance(d, dict):
-                continue
+                return None
             cv = d.get("_cellVariants") or {}
             cv_nonempty = {str(k): v for k, v in cv.items() if v} if isinstance(cv, dict) else str(cv)
             os_ = d.get("orderStatus")
-            out.append({
+            return {
                 "index": d.get("index"), "status": (os_.get("title") if isinstance(os_, dict) else os_),
                 "_rowVariant": d.get("_rowVariant"), "_cellVariants": cv_nonempty,
                 "prepayAmount": d.get("prepayAmount"), "fullPrepayAmount": d.get("fullPrepayAmount"),
@@ -1526,9 +1523,14 @@ def _detail_sample_debug(md_orders, n=45):
                 "total": d.get("total"),
                 "description": str(d.get("description") or "")[:70],
                 "privateDescription": str(d.get("privateDescription") or "")[:70],
-            })
+            }
         except Exception:
-            continue
+            return None
+    out = []
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        for r in ex.map(one, ids):
+            if r:
+                out.append(r)
     try:
         requests.put(f"{FIREBASE_DB_URL}/shop-reports/mydrop-detail-debug.json",
                      data=json.dumps({"at": dt.datetime.utcnow().isoformat(), "samples": out},
