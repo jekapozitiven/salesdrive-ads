@@ -1532,26 +1532,25 @@ def update_website_margins(md_orders, days, pay_idx=None):
             for oid, o in ords.items():
                 if not o or o.get("phone"):          # телефонные не трогаем — у них своя маржа
                     continue
-                m = mbe.get(str(o.get("ext") or ""))
-                if not isinstance(m, dict):
-                    continue
-                if m.get("hidden"):                   # стал Недозвон/Отмена и т.п. — убираем из базы
+                ext = str(o.get("ext") or "")
+                m = mbe.get(ext)
+                pd = (pay_idx or {}).get(ext)        # деталь: (pay, depAmt) — задаток/оплата
+                if isinstance(m, dict) and m.get("hidden"):
                     upd[oid] = None
                     continue
-                if not m.get("gross"):
-                    continue                          # нет маржи в MyDrop — не перетираем нулём
-                ups = _num(o.get("upsSum"))
-                sale = round(max(_num(m.get("total")) - ups, 0.0), 2) or o.get("sum")
-                o2 = dict(o)
-                ext = str(o.get("ext") or "")
-                pd = (pay_idx or {}).get(ext)   # деталь: (pay, depAmt) — приоритетнее списочного
-                pay_val = pd[0] if pd else m.get("pay", "cod")
-                dep_val = pd[1] if pd else m.get("depAmt", 0)
-                o2.update({"margin": round(m["gross"], 2),   # realMargin уже включает допрод — не прибавляем ups
-                           "drop": m["drop"], "sum": sale,
-                           "approved": m["approved"], "sold": m["sold"], "refused": m["refused"],
-                           "pay": pay_val, "depAmt": dep_val})
-                upd[oid] = o2
+                o2 = dict(o); changed = False
+                # ТИП ОПЛАТЫ — ставим ВСЕГДА по детали, независимо от маржи/статуса (покрываем весь месяц)
+                if pd and (o.get("pay") != pd[0] or o.get("depAmt") != pd[1]):
+                    o2["pay"] = pd[0]; o2["depAmt"] = pd[1]; changed = True
+                # МАРЖА/статусы — только если есть маржа в MyDrop (не перетираем нулём)
+                if isinstance(m, dict) and m.get("gross"):
+                    ups = _num(o.get("upsSum"))
+                    sale = round(max(_num(m.get("total")) - ups, 0.0), 2) or o.get("sum")
+                    o2.update({"margin": round(m["gross"], 2), "drop": m["drop"], "sum": sale,
+                               "approved": m["approved"], "sold": m["sold"], "refused": m["refused"]})
+                    changed = True
+                if changed:
+                    upd[oid] = o2
             if upd:
                 requests.patch(url, data=json.dumps(upd, ensure_ascii=False).encode("utf-8"),
                                headers={"Content-Type": "application/json"}, timeout=60)
