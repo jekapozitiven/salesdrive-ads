@@ -903,6 +903,17 @@ def _shop_from_source_title(title):
     return ""
 
 
+def _src_from_mydrop_ordersource(title):
+    """orderSource.title MyDrop -> КЛЮЧ-источник в ads-ord (Сайт-Black-street / Сайт-Bonna-shop / Хор-Blink / Хор-Blink-FB)."""
+    shop = _shop_from_source_title(title)
+    if not shop:
+        return None
+    t = str(title or "").lower()
+    if shop == "Blink":
+        return "Хор-Blink-FB" if ("facebook" in t or re.search(r"\bfb\b", t)) else "Хор-Blink"
+    return "Сайт-" + shop
+
+
 def _phone_shop(m, detail=None):
     """Магазин телефонного заказа по «Источник заказа».
     Поле orderSource есть ТОЛЬКО в карточке заказа (detail), в списке его нет — поэтому detail обязателен."""
@@ -1548,14 +1559,17 @@ def build_pay_detail_index(md_orders, cap=None):
             if not ext:
                 return None
             pay, dep = _pay_from_detail(d)
-            return (mid, ext, pay, dep)
+            os_ = d.get("orderSource")
+            os_title = (os_.get("title") if isinstance(os_, dict) else os_) or ""
+            src = _src_from_mydrop_ordersource(os_title)   # магазин-источник (Сайт-Black-street / Хор-Blink / Хор-Blink-FB)
+            return (mid, ext, pay, dep, src)
         except Exception:
             return None
     new_cache = {}
     with ThreadPoolExecutor(max_workers=10) as ex:
         for r in ex.map(work, todo):
             if r:
-                new_cache[r[0]] = {"ext": r[1], "pay": r[2], "dep": r[3]}
+                new_cache[r[0]] = {"ext": r[1], "pay": r[2], "dep": r[3], "src": r[4], "day": id_date.get(r[0], "")}
     cache.update(new_cache)
     if FIREBASE_DB_URL and new_cache:
         try:
@@ -1808,6 +1822,125 @@ def fetch_returns():
             print(f"returns push error: {e}")
 
 
+def sd_order_by_ext(ext):
+    """Один заказ SalesDrive по внешнему номеру (externalId) — чтобы взять артикулы для потерянного заказа."""
+    if not SD_URL or not SD_KEY or not ext:
+        return None
+    try:
+        r = requests.get(_base() + "/api/order/list/",
+                         params={"limit": 5, "filter[externalId]": str(ext)},
+                         headers={"Form-Api-Key": SD_KEY}, timeout=TIMEOUT)
+        if r.status_code != 200:
+            return None
+        for o in orders_from(r.json()):
+            if str(o.get("externalId")) == str(ext):
+                return o
+    except Exception:
+        return None
+    return None
+
+
+def find_and_add_missing(md_orders):
+    """Дописывает в ads-ord заказы, которые ЕСТЬ в MyDrop (магазин по orderSource), но ПОТЕРЯНЫ в приложении.
+    Артикул/категорию берём из SalesDrive по внешнему номеру. Ничего существующего не трогаем."""
+    if not FIREBASE_DB_URL:
+        return
+    try:
+        cache = requests.get(f"{FIREBASE_DB_URL}/shop-reports/ads-pay-cache.json", timeout=40).json() or {}
+    except Exception:
+        cache = {}
+    pay_days = int(os.environ.get("PAY_DAYS", "20"))
+    today = dt.date.today()
+    srcs = ["Сайт-Black-street", "Сайт-Bonna-shop", "Хор-Blink", "Хор-Blink-FB"]
+    # уже имеющиеся внешние номера в ads-ord за окно
+    existing = set()
+    for src in srcs:
+        for dd in range(pay_days + 1):
+            day = (today - dt.timedelta(days=dd)).isoformat()
+            try:
+                ords = requests.get(f"{FIREBASE_DB_URL}/shop-reports/ads-ord/{quote(src, safe='')}/{day}.json", timeout=40).json() or {}
+            except Exception:
+                ords = {}
+            for o in ords.values():
+                if o and o.get("ext"):
+                    existing.add(str(o["ext"]))
+    store_by_src = {"Сайт-Black-street": "blackstreet", "Сайт-Bonna-shop": "bonna",
+                    "Хор-Blink": "blink", "Хор-Blink-FB": "blink"}
+    cap = int(os.environ.get("MISSING_CAP", "30"))   # лимит дозапросов SalesDrive за прогон (10/мин)
+    sd_sleep = float(os.environ.get("MISSING_SD_SLEEP", "6.5"))
+    added = {}
+    n = 0
+    for m in md_orders:
+        if n >= cap:
+            break
+        if not isinstance(m, dict):
+            continue
+        c = cache.get(str(m.get("id")))
+        if not c or not c.get("ext") or not c.get("src"):
+            continue
+        ext = str(c["ext"])
+        if ext in existing:
+            continue
+        if _md_hidden(m):
+            continue
+        src = c["src"]; day = c.get("day") or str(m.get("dateTime") or "")[:10]
+        if not day:
+            continue
+        # артикулы/категория из SalesDrive по ext (с паузой — лимит SalesDrive 10/мин)
+        sd = sd_order_by_ext(ext)
+        time.sleep(sd_sleep)
+        cat = None; items = []
+        oid_key = "md" + str(m.get("id"))
+        if sd:
+            if sd.get("id"):
+                oid_key = str(sd.get("id"))   # тот же ключ, что у build_ord — чтобы полный прогон перезаписал, а не задвоил
+            e = extract(sd)
+            store = store_by_src.get(src)
+            cats = []
+            for sku in e["skus"]:
+                cc = category_of(sku, store)
+                if cc and cc not in cats:
+                    cats.append(cc)
+            if len(cats) > 1:
+                catkey, catname = MIXED_KEY, "Потребує розподілу (кілька категорій)"
+            elif cats:
+                catkey, catname = fbkey(cats[0]), cats[0]
+            else:
+                catkey, catname = "_no_cat", "(без категорії)"
+            for it in e["mainItems"]:
+                info = product_of(it.get("sku"), store) if it.get("sku") else {}
+                items.append({"sku": it.get("sku"), "name": it.get("name") or info.get("name") or "",
+                              "img": info.get("img") or "", "href": it.get("href") or "", "price": it.get("price")})
+            camp = camp_of(src, [it.get("name") for it in items])
+        else:
+            catkey, catname, camp = "_no_cat", "(без категорії)", ""
+        info = _md_margin_info(m)
+        if info.get("hidden"):
+            continue
+        ups = 0.0
+        rec = {"catKey": catkey, "catName": catname, "camp": camp,
+               "approved": info["approved"], "sold": info["sold"], "refused": info["refused"],
+               "sum": info["total"], "upsSum": ups, "upsCount": 0,
+               "margin": round(info["gross"], 2), "drop": info["drop"],
+               "pay": info.get("pay", "cod"), "depAmt": info.get("depAmt", 0),
+               "items": items, "ext": ext, "fromMD": 1}
+        added.setdefault(src, {}).setdefault(day, {})[oid_key] = rec
+        existing.add(ext)
+        n += 1
+    # запись
+    cnt = 0
+    for src, days in added.items():
+        for day, ords in days.items():
+            try:
+                requests.patch(f"{FIREBASE_DB_URL}/shop-reports/ads-ord/{quote(src, safe='')}/{day}.json",
+                               data=json.dumps(ords, ensure_ascii=False).encode("utf-8"),
+                               headers={"Content-Type": "application/json"}, timeout=60)
+                cnt += len(ords)
+            except Exception as e:
+                print(f"add-missing {src}/{day}: {e}")
+    print(f"add-missing: дописано потерянных заказов {cnt}")
+
+
 def phone_only_run():
     """Лёгкий частый прогон: ТОЛЬКО MyDrop. Делает две вещи без SalesDrive (не тратит его квоту):
     1) ручные (web) заказы -> корзина «Телефон»; 2) дотягивает маржу сайтовым заказам из MyDrop.
@@ -1841,6 +1974,10 @@ def phone_only_run():
         update_website_margins(md, wdays, pay_idx)
     except Exception as e:
         print(f"update-margins: пропущено из-за ошибки: {e}")
+    try:
+        find_and_add_missing(md)   # дописать потерянные заказы (MyDrop нашёл, артикул из SalesDrive по ext)
+    except Exception as e:
+        print(f"add-missing: пропущено из-за ошибки: {e}")
     try:
         fetch_returns()   # возвраты из Google-таблицы -> Firebase (для «Звіти по магазинах»)
     except Exception as e:
