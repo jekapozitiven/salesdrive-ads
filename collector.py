@@ -199,6 +199,36 @@ def _is_fb(o):
     return False
 
 
+def _fb_field_probe(orders):
+    """ДИАГНОСТИКА: ищет среди заказов Blink, в каком поле лежит значение 'fb'/'facebook'
+    (поле «Джерело» в API может называться иначе) -> Firebase shop-reports/fb-field-probe."""
+    if not FIREBASE_DB_URL:
+        return
+    from collections import Counter
+    fields = Counter()
+    samples = {}
+    blink_n = 0
+    for o in orders:
+        if not isinstance(o, dict) or shop_of(o) != "Blink":
+            continue
+        blink_n += 1
+        for k, v in o.items():
+            if isinstance(v, str):
+                vl = v.strip().lower()
+                if vl and len(vl) < 40 and (vl == "fb" or "facebook" in vl or vl.startswith("fb")):
+                    fields[str(k)] += 1
+                    samples.setdefault(str(k), v[:40])
+    try:
+        requests.put(f"{FIREBASE_DB_URL}/shop-reports/fb-field-probe.json",
+                     data=json.dumps({"at": dt.datetime.utcnow().isoformat(),
+                                      "blinkOrders": blink_n, "fields": dict(fields), "samples": samples},
+                                     ensure_ascii=False).encode("utf-8"),
+                     headers={"Content-Type": "application/json"}, timeout=40)
+        print(f"fb-probe: Blink {blink_n}, поля с fb: {dict(fields)}")
+    except Exception as e:
+        print(f"fb-probe: {e}")
+
+
 def site_source(o):
     shop = shop_of(o)                      # Black-street / Bonna-shop / Blink / "?..."
     vyt = o.get("expensesAmount") or 0
@@ -1871,6 +1901,10 @@ def main():
 
     orders = fetch_all(date_from)
     print(f"Всего заказов за период: {len(orders)}")
+    try:
+        _fb_field_probe(orders)   # ДИАГНОСТИКА: в каком поле SalesDrive лежит «fb» (для источника Blink-FB)
+    except Exception as e:
+        print(f"fb-probe: {e}")
 
     # маржа из MyDrop по внешнему номеру (если задан ключ)
     mbe = {}
