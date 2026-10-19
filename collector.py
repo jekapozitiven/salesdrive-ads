@@ -184,14 +184,26 @@ def norm_sku(s):
 # Витрати пусто -> "Сайт-<магазин>" (Google-трафик, НУЖЕН);
 # Витрати есть  -> "Prom-<магазин>" (Пром, НЕ нужен);
 # Blink -> всегда "Хор-Blink".
-WANTED_SOURCES = {"Сайт-Black-street", "Сайт-Bonna-shop", "Хор-Blink"}
+WANTED_SOURCES = {"Сайт-Black-street", "Сайт-Bonna-shop", "Хор-Blink", "Хор-Blink-FB"}
+
+# поля SalesDrive, где может лежать «джерело»; значение-маркер Facebook
+_FB_SOURCE_FIELDS = ("utmSource", "utm_source", "trafficSource", "source", "джерело", "dzherelo")
+_FB_MARKERS = ("fb", "facebook", "фейс", "фб")
+
+def _is_fb(o):
+    """Заказ пришёл с Facebook: в поле «джерело» (utmSource/trafficSource/…) есть fb/facebook."""
+    for k in _FB_SOURCE_FIELDS:
+        v = str(o.get(k) or "").lower()
+        if any(mk in v for mk in _FB_MARKERS):
+            return True
+    return False
 
 
 def site_source(o):
     shop = shop_of(o)                      # Black-street / Bonna-shop / Blink / "?..."
     vyt = o.get("expensesAmount") or 0
     if shop == "Blink":
-        return "Хор-Blink"
+        return "Хор-Blink-FB" if _is_fb(o) else "Хор-Blink"   # Facebook-трафик Blink — отдельный источник
     if shop in ("Black-street", "Bonna-shop"):
         return ("Prom-" if vyt else "Сайт-") + shop
     return None                            # неизвестный сайт
