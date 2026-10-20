@@ -259,6 +259,7 @@ def extract(o):
         "sajt": o.get("sajt"),
         "expenses": o.get("expensesAmount"),
         "source": site_source(o),
+        "utmCampaign": (o.get("utmCampaign") or o.get("utm_campaign") or "").strip(),
         "skus": [p.get("sku") for p in main],
         "mainItems": [{"sku": p.get("sku"), "price": amt(p),
                        "href": p.get("href") or "", "name": p.get("text") or p.get("name") or ""}
@@ -528,13 +529,18 @@ def aggregate(orders, margin_by_ext=None):
         day = e["date"]
         if not re.match(r"^\d{4}-\d{2}-\d{2}$", day or ""):
             continue
-        cats = order_categories(e)
-        if len(cats) > 1:
-            catkey, catname = MIXED_KEY, "Потребує розподілу (кілька категорій)"
-        elif cats:
-            catkey, catname = fbkey(cats[0]), cats[0]
+        if e["source"] == "Хор-Blink-FB":
+            # FB-заказы Blink группируем по рекламной кампании (utmCampaign из SalesDrive), а не по категории товара
+            _camp = e.get("utmCampaign") or "(без кампанії)"
+            catkey, catname = fbkey(_camp), _camp
         else:
-            catkey, catname = "_no_cat", "(без категорії)"
+            cats = order_categories(e)
+            if len(cats) > 1:
+                catkey, catname = MIXED_KEY, "Потребує розподілу (кілька категорій)"
+            elif cats:
+                catkey, catname = fbkey(cats[0]), cats[0]
+            else:
+                catkey, catname = "_no_cat", "(без категорії)"
         srckey = fbkey(e["source"])
         cell = agg.setdefault(srckey, {}).setdefault(day, {}).setdefault(catkey, {
             "cat": catname, "leads": 0, "approved": 0, "sum": 0.0,
@@ -667,7 +673,11 @@ def build_ord(orders, mbe=None, mbe_ph=None, pay_idx=None):
                 cats.append(p["category"])
             items.append({"sku": it["sku"] or "", "name": it["name"] or p["name"] or it["sku"] or "",
                           "img": p["img"] or "", "href": it["href"] or "", "price": it["price"]})
-        if len(cats) > 1:
+        if e["source"] == "Хор-Blink-FB":
+            # FB: кампания из utmCampaign (SalesDrive), а не категория товара
+            _camp = e.get("utmCampaign") or "(без кампанії)"
+            catkey, catname = fbkey(_camp), _camp
+        elif len(cats) > 1:
             catkey, catname = MIXED_KEY, "Потребує розподілу (кілька категорій)"
         elif cats:
             catkey, catname = fbkey(cats[0]), cats[0]
@@ -706,7 +716,7 @@ def build_ord(orders, mbe=None, mbe_ph=None, pay_idx=None):
         pd = pay_idx.get(str(e["externalId"] or ""))   # деталь (задаток/оплата по цвету/примечанию) приоритетнее
         if pd:
             pay, depAmt = pd[0], pd[1]
-        camp = camp_of(e["source"], [it.get("name") for it in items])
+        camp = (e.get("utmCampaign") or "") if e["source"] == "Хор-Blink-FB" else camp_of(e["source"], [it.get("name") for it in items])
         out.setdefault(fbkey(e["source"]), {}).setdefault(day, {})[oid] = {
             "catKey": catkey, "catName": catname, "camp": camp,
             "approved": approved, "sold": sold, "refused": refused,
