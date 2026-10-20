@@ -22,6 +22,18 @@ import requests
 
 SD_URL    = os.environ.get("SALESDRIVE_URL", "").strip().rstrip("/")
 SD_KEY    = os.environ.get("SALESDRIVE_API_KEY", "").strip()
+# Несколько ключей SalesDrive: основной + до двух дополнительных. Запросы раскидываем
+# по кругу (round-robin) — каждый ключ получает ~1/3 нагрузки, а суточная квота = 3×1000.
+# Если ключ упёрся в суточный лимит — автоматически переключаемся на следующий живой.
+SD_KEYS   = [k for k in (
+    SD_KEY,
+    os.environ.get("SALESDRIVE_API_KEY2", "").strip(),
+    os.environ.get("SALESDRIVE_API_KEY3", "").strip(),
+) if k]
+if not SD_KEYS:
+    SD_KEYS = [SD_KEY]
+_sd_key_i = 0          # указатель round-robin
+_sd_dead  = set()      # индексы ключей, упёршихся в суточный лимит
 DAYS      = int(os.environ.get("SD_DAYS", "14"))
 LIMIT     = int(os.environ.get("SD_LIMIT", "100"))
 MAX_PAGES = int(os.environ.get("SD_MAX_PAGES", "50"))
@@ -288,6 +300,18 @@ def _base():
     return u
 
 
+def _next_key():
+    """Следующий живой ключ по кругу (round-robin). None — если все упёрлись в лимит."""
+    global _sd_key_i
+    n = len(SD_KEYS)
+    for _ in range(n):
+        i = _sd_key_i % n
+        _sd_key_i += 1
+        if i not in _sd_dead:
+            return i, SD_KEYS[i]
+    return None, None
+
+
 def fetch_page(page, date_from):
     params = {
         "page": page,
@@ -295,30 +319,31 @@ def fetch_page(page, date_from):
         "filter[orderTime][from]": date_from,
         "filter[statusId]": "__ALL__",
     }
-    for attempt in range(4):
-        r = requests.get(_base() + "/api/order/list/", params=params,
-                         headers={"Form-Api-Key": SD_KEY}, timeout=TIMEOUT)
-        if r.status_code == 200:
-            break
-        if r.status_code in (429, 500, 502, 503, 504):
-            wait = 15 * (attempt + 1)
-            print(f"SalesDrive {r.status_code} (ліміт?) — чекаю {wait}s, спроба {attempt + 1}/4")
-            time.sleep(wait)
-            continue
-        # суточный лимit SalesDrive (1000/24h) прилетает как 400 с "API limit" — это НЕ ошибка кода,
-        # мягко пропускаем прогон (следующий по расписанию добере, когда квота сбросится).
-        if r.status_code == 400 and "limit" in (r.text or "").lower():
-            print("SalesDrive: досягнуто добовий ліміт (1000/24h) — пропускаю прогін, "
-                  "наступний за розкладом добере після скидання квоти.")
+    tries = len(SD_KEYS) * 2 + 2
+    for attempt in range(tries):
+        ki, key = _next_key()
+        if key is None:
+            print("SalesDrive: все ключи упёрлись в суточный лимит — пропускаю прогон "
+                  "(следующий по расписанию доберёт после сброса квоты).")
             sys.exit(0)
+        r = requests.get(_base() + "/api/order/list/", params=params,
+                         headers={"Form-Api-Key": key}, timeout=TIMEOUT)
+        if r.status_code == 200:
+            try:
+                return r.json()
+            except Exception:
+                raise SystemExit(f"SalesDrive вернул не-JSON: {r.text[:400]}")
+        if r.status_code in (429, 500, 502, 503, 504):
+            print(f"SalesDrive {r.status_code} (ключ #{ki + 1}) — жду 10s, попытка {attempt + 1}/{tries}")
+            time.sleep(10)
+            continue
+        if r.status_code == 400 and "limit" in (r.text or "").lower():
+            print(f"SalesDrive: ключ #{ki + 1} упёрся в суточный лимит — переключаюсь на следующий.")
+            _sd_dead.add(ki)
+            continue
         raise SystemExit(f"SalesDrive HTTP {r.status_code}: {r.text[:400]}")
-    else:
-        print("SalesDrive: ліміт не відпустив — пропускаю прогін (наступний за розкладом добере).")
-        sys.exit(0)   # м'який вихід, джоб не червоний
-    try:
-        return r.json()
-    except Exception:
-        raise SystemExit(f"SalesDrive вернул не-JSON: {r.text[:400]}")
+    print("SalesDrive: не удалось получить страницу — пропускаю прогон.")
+    sys.exit(0)
 
 
 def orders_from(resp):
@@ -1845,12 +1870,15 @@ def fetch_returns():
 
 def sd_order_by_ext(ext):
     """Один заказ SalesDrive по внешнему номеру (externalId) — чтобы взять артикулы для потерянного заказа."""
-    if not SD_URL or not SD_KEY or not ext:
+    if not SD_URL or not SD_KEYS or not ext:
+        return None
+    _ki, _key = _next_key()
+    if not _key:
         return None
     try:
         r = requests.get(_base() + "/api/order/list/",
                          params={"limit": 5, "filter[externalId]": str(ext)},
-                         headers={"Form-Api-Key": SD_KEY}, timeout=TIMEOUT)
+                         headers={"Form-Api-Key": _key}, timeout=TIMEOUT)
         if r.status_code != 200:
             return None
         for o in orders_from(r.json()):
@@ -2048,7 +2076,7 @@ def main():
     if os.environ.get("SD_MYDROP", "").strip() in ("1", "true", "yes"):
         mydrop_probe(DAYS)
         return
-    if not SD_URL or not SD_KEY:
+    if not SD_URL or not SD_KEYS:
         raise SystemExit("Нет SALESDRIVE_URL или SALESDRIVE_API_KEY — положи в Secrets/Variables.")
     date_from = (dt.date.today() - dt.timedelta(days=DAYS)).isoformat()
     print(f"SalesDrive: заказы с {date_from}, по {LIMIT}/страницу.")
