@@ -17,7 +17,7 @@ BBB CLUB — сборщик рекламной статистики по кам�
 """
 import os, sys, json, time, re, datetime as dt
 from collections import Counter
-from urllib.parse import quote
+from urllib.parse import quote, unquote_plus
 import requests
 
 SD_URL    = os.environ.get("SALESDRIVE_URL", "").strip().rstrip("/")
@@ -199,6 +199,17 @@ def _is_fb(o):
     return False
 
 
+def _dec_camp(v):
+    """utm_campaign из SalesDrive -> как в Facebook: '+' и %xx раскодируем в пробелы/символы."""
+    s = str(v or "").strip()
+    if not s:
+        return ""
+    try:
+        return unquote_plus(s).strip()
+    except Exception:
+        return s
+
+
 def _fb_field_probe(orders):
     """ДИАГНОСТИКА: ищет среди заказов Blink, в каком поле лежит значение 'fb'/'facebook'
     (поле «Джерело» в API может называться иначе) -> Firebase shop-reports/fb-field-probe."""
@@ -259,7 +270,7 @@ def extract(o):
         "sajt": o.get("sajt"),
         "expenses": o.get("expensesAmount"),
         "source": site_source(o),
-        "utmCampaign": (o.get("utmCampaign") or o.get("utm_campaign") or "").strip(),
+        "utmCampaign": _dec_camp(o.get("utmCampaign") or o.get("utm_campaign") or ""),
         "skus": [p.get("sku") for p in main],
         "mainItems": [{"sku": p.get("sku"), "price": amt(p),
                        "href": p.get("href") or "", "name": p.get("text") or p.get("name") or ""}
