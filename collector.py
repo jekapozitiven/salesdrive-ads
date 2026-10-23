@@ -196,7 +196,7 @@ def norm_sku(s):
 # Витрати пусто -> "Сайт-<магазин>" (Google-трафик, НУЖЕН);
 # Витрати есть  -> "Prom-<магазин>" (Пром, НЕ нужен);
 # Blink -> всегда "Хор-Blink".
-WANTED_SOURCES = {"Сайт-Black-street", "Сайт-Bonna-shop", "Хор-Blink", "Хор-Blink-FB"}
+WANTED_SOURCES = {"Сайт-Black-street", "Сайт-Bonna-shop", "Хор-Blink", "Хор-Blink-FB", "Сайт-Black-street-FB"}
 
 # поля SalesDrive, где может лежать «джерело»; значение-маркер Facebook
 _FB_SOURCE_FIELDS = ("utmSource", "utm_source", "trafficSource", "source", "джерело", "dzherelo")
@@ -258,6 +258,8 @@ def site_source(o):
     if shop == "Blink":
         return "Хор-Blink-FB" if _is_fb(o) else "Хор-Blink"   # Facebook-трафик Blink — отдельный источник
     if shop in ("Black-street", "Bonna-shop"):
+        if shop == "Black-street" and _is_fb(o) and not vyt:
+            return "Сайт-Black-street-FB"   # Facebook-трафик Black-street (сайт) — отдельный источник
         return ("Prom-" if vyt else "Сайт-") + shop
     return None                            # неизвестный сайт
 
@@ -565,7 +567,7 @@ def aggregate(orders, margin_by_ext=None):
         day = e["date"]
         if not re.match(r"^\d{4}-\d{2}-\d{2}$", day or ""):
             continue
-        if e["source"] == "Хор-Blink-FB":
+        if e["source"].endswith("-FB"):
             # FB-заказы Blink группируем по рекламной кампании (utmCampaign из SalesDrive), а не по категории товара
             _camp = e.get("utmCampaign") or "(без кампанії)"
             catkey, catname = fbkey(_camp), _camp
@@ -709,7 +711,7 @@ def build_ord(orders, mbe=None, mbe_ph=None, pay_idx=None):
                 cats.append(p["category"])
             items.append({"sku": it["sku"] or "", "name": it["name"] or p["name"] or it["sku"] or "",
                           "img": p["img"] or "", "href": it["href"] or "", "price": it["price"]})
-        if e["source"] == "Хор-Blink-FB":
+        if e["source"].endswith("-FB"):
             # FB: кампания из utmCampaign (SalesDrive), а не категория товара
             _camp = e.get("utmCampaign") or "(без кампанії)"
             catkey, catname = fbkey(_camp), _camp
@@ -752,7 +754,7 @@ def build_ord(orders, mbe=None, mbe_ph=None, pay_idx=None):
         pd = pay_idx.get(str(e["externalId"] or ""))   # деталь (задаток/оплата по цвету/примечанию) приоритетнее
         if pd:
             pay, depAmt = pd[0], pd[1]
-        camp = (e.get("utmCampaign") or "") if e["source"] == "Хор-Blink-FB" else camp_of(e["source"], [it.get("name") for it in items])
+        camp = (e.get("utmCampaign") or "") if e["source"].endswith("-FB") else camp_of(e["source"], [it.get("name") for it in items])
         out.setdefault(fbkey(e["source"]), {}).setdefault(day, {})[oid] = {
             "catKey": catkey, "catName": catname, "camp": camp,
             "approved": approved, "sold": sold, "refused": refused,
@@ -955,8 +957,11 @@ def _src_from_mydrop_ordersource(title):
     if not shop:
         return None
     t = str(title or "").lower()
+    is_fb = ("facebook" in t or re.search(r"\bfb\b", t))
     if shop == "Blink":
-        return "Хор-Blink-FB" if ("facebook" in t or re.search(r"\bfb\b", t)) else "Хор-Blink"
+        return "Хор-Blink-FB" if is_fb else "Хор-Blink"
+    if shop == "Black-street" and is_fb:
+        return "Сайт-Black-street-FB"
     return "Сайт-" + shop
 
 
@@ -1900,7 +1905,7 @@ def find_and_add_missing(md_orders):
         cache = {}
     pay_days = int(os.environ.get("PAY_DAYS", "20"))
     today = dt.date.today()
-    srcs = ["Сайт-Black-street", "Сайт-Bonna-shop", "Хор-Blink", "Хор-Blink-FB"]
+    srcs = ["Сайт-Black-street", "Сайт-Bonna-shop", "Хор-Blink", "Хор-Blink-FB", "Сайт-Black-street-FB"]
     # уже имеющиеся внешние номера в ads-ord за окно
     existing = set()
     for src in srcs:
@@ -1914,7 +1919,7 @@ def find_and_add_missing(md_orders):
                 if o and o.get("ext"):
                     existing.add(str(o["ext"]))
     store_by_src = {"Сайт-Black-street": "blackstreet", "Сайт-Bonna-shop": "bonna",
-                    "Хор-Blink": "blink", "Хор-Blink-FB": "blink"}
+                    "Хор-Blink": "blink", "Хор-Blink-FB": "blink", "Сайт-Black-street-FB": "blackstreet"}
     cap = int(os.environ.get("MISSING_CAP", "30"))   # лимит дозапросов SalesDrive за прогон (10/мин)
     sd_sleep = float(os.environ.get("MISSING_SD_SLEEP", "6.5"))
     added = {}
