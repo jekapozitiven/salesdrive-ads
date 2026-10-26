@@ -2166,6 +2166,8 @@ def main():
         for _src, _days in ordtree.items():
             for _day, _os in _days.items():
                 for _o in _os.values():
+                    if not isinstance(_o, dict):   # None = скрытый заказ (помечен на удаление) — пропускаем
+                        continue
                     _cov_t += 1
                     if _o.get("camp"):
                         _cov_c += 1
