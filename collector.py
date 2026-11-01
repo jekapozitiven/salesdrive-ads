@@ -283,6 +283,8 @@ def extract(o):
         "shop": shop_of(o),
         "sajt": o.get("sajt"),
         "expenses": o.get("expensesAmount"),
+        "payed": _num(o.get("payedAmount")),        # SalesDrive «Оплачено» → полная оплата, если > 0
+        "comment": str(o.get("comment") or ""),
         "source": site_source(o),
         "utmCampaign": _dec_camp(o.get("utmCampaign") or o.get("utm_campaign") or ""),
         "skus": [p.get("sku") for p in main],
@@ -622,18 +624,20 @@ def push_ads_firebase(agg):
 
 
 # ─── тип оплаты заказа (для статистики в «Звіти по магазинах») ──────────────
-# задаток — ловим по примечанию (description) с учётом опечаток; сумма — опционально.
-# полная оплата — по статусу MyDrop «Оплачен» (клиент оплатил заказ целиком).
-# иначе — обычный наложенный платёж.
-_DEPOSIT_RX = re.compile(r"за[вй]?д[ао]т[оа]?к|zav?datok", re.I)  # задаток/завдаток/задоток/zadatok/zavdatok (вкл. опечатки)
-_DEPOSIT_AMT_RX = re.compile(r"за[вй]?д[а-яіїє]*[\s:\-]*?(\d{2,5})", re.I)
+# ПРАВИЛА ТИПА ОПЛАТЫ (01.11.2026):
+#  задаток — ТОЛЬКО если в примечании есть слово «задаток/завдаток» И СРАЗУ ЗА НИМ СУММА («завдаток 200»).
+#            Слово без суммы — НЕ задаток.
+#  полная оплата — поле SalesDrive «Оплачено» (payedAmount) > 0.
+#  иначе — накладений платіж.
+# Задаток проверяется первым (есть «завдаток 200» → задаток, даже если «Оплачено» заполнено).
+_DEPOSIT_RX = re.compile(r"(?:за[вй]?д[ао]т[оа]?к|zav?datok)[a-zа-яіїє]*[\s:\-–—=]*(\d{2,5})", re.I)
+_DEPOSIT_AMT_RX = _DEPOSIT_RX
 
-def _paytype(desc, status_title):
-    """'deposit' | 'full' | 'cod' по примечанию и статусу MyDrop."""
-    d = desc or ""
-    if _DEPOSIT_RX.search(d):
+def _paytype(desc, status_title=None, sd_payed=0):
+    """'deposit' | 'full' | 'cod': примечание (задаток+сумма) → SalesDrive «Оплачено» → накладений."""
+    if _DEPOSIT_RX.search(desc or ""):
         return "deposit"
-    if "оплач" in (status_title or "").lower():   # статус «Оплачен» = полная оплата
+    if _num(sd_payed) > 0:
         return "full"
     return "cod"
 
@@ -664,22 +668,20 @@ def _find_deposit_note(obj, depth=0):
     return None
 
 
-def _pay_from_detail(d, list_order=None):
-    """Тип оплаты по ДЕТАЛЬНОЙ карточке MyDrop. Возвращает (pay, depAmt).
-    Приоритеты:
-      1) ЗАДАТОК — только по примечанию (description + privateDescription), с учётом опечаток;
-      2) ПОЛНАЯ ОПЛАТА — жёлтый/красный цвет строки (_rowVariant) ИЛИ заполнено поле «Предоплата»;
+def _pay_from_detail(d, list_order=None, sd_payed=0):
+    """Тип оплаты по карточке MyDrop (+ SalesDrive «Оплачено»). Возвращает (pay, depAmt).
+      1) ЗАДАТОК — примечание со словом «задаток/завдаток» И суммой сразу за ним (любое строковое поле карточки);
+      2) ПОЛНАЯ ОПЛАТА — SalesDrive payedAmount («Оплачено») > 0 (цвет строки/предоплата MyDrop НЕ смотрим);
       3) иначе — накладений платіж."""
     d = d or {}
-    # задаток/завдаток — ищем по ВСЕМ строковым полям карточки (примечание может быть в любом поле)
     dep_hit = _find_deposit_note(d)
     if not dep_hit and isinstance(list_order, dict):
         dep_hit = _find_deposit_note(list_order)
     if dep_hit:
-        return "deposit", _deposit_amount(dep_hit)
-    rv = str(d.get("_rowVariant") or "").strip().lower()
-    prepay = _num(d.get("prepayAmount")) + _num(d.get("fullPrepayAmount"))
-    if rv in _FULL_ROW_COLORS or prepay > 0:
+        amt = _deposit_amount(dep_hit)
+        if amt > 0:
+            return "deposit", amt
+    if _num(sd_payed) > 0:
         return "full", 0
     return "cod", 0
 
@@ -745,15 +747,25 @@ def build_ord(orders, mbe=None, mbe_ph=None, pay_idx=None):
             approved = m.get("approved", 0); sold = m.get("sold", 0); refused = m.get("refused", 0)
             # продажна з MyDrop (total). Допрод лишаємо окремо: продажна(осн.) = total − допрод
             sale = round(max(_num(m.get("total")) - ups, 0.0), 2) or e["mainSum"]
-            pay = m.get("pay", "cod"); depAmt = m.get("depAmt", 0)   # тип оплаты (задаток/оплачен/наложенный)
+            pay = m.get("pay", "cod"); depAmt = m.get("depAmt", 0)   # задаток по списку MyDrop (слово+сумма)
         else:
             margin = ups; drop = 0.0; sold = 0; refused = 0   # без MyDrop: хотя бы допрод-маржа
             approved = 1 if str(x.get("statusId")) in APRUV_STATUS else 0
             sale = e["mainSum"]
             pay = "cod"; depAmt = 0
-        pd = pay_idx.get(str(e["externalId"] or ""))   # деталь (задаток/оплата по цвету/примечанию) приоритетнее
-        if pd:
-            pay, depAmt = pd[0], pd[1]
+        # ТИП ОПЛАТЫ: 1) задаток (слово+сумма в примечании MyDrop — деталь/список — или в комментарии SalesDrive)
+        #             2) полная оплата — SalesDrive «Оплачено» > 0   3) иначе накладений
+        pd = pay_idx.get(str(e["externalId"] or ""))
+        if pd and pd[0] == "deposit" and _num(pd[1]) > 0:
+            pay, depAmt = "deposit", pd[1]
+        elif pay == "deposit" and _num(depAmt) > 0:
+            pass
+        elif _deposit_amount(e.get("comment")) > 0:
+            pay, depAmt = "deposit", _deposit_amount(e.get("comment"))
+        elif _num(e.get("payed")) > 0:
+            pay, depAmt = "full", 0
+        else:
+            pay, depAmt = "cod", 0
         camp = (e.get("utmCampaign") or "") if e["source"].endswith("-FB") else camp_of(e["source"], [it.get("name") for it in items])
         out.setdefault(fbkey(e["source"]), {}).setdefault(day, {})[oid] = {
             "catKey": catkey, "catName": catname, "camp": camp,
@@ -1235,18 +1247,11 @@ def _md_margin_info(m):
     st_title = str((m.get("orderStatus") or {}).get("title") or "")
     desc = str(m.get("description") or "")
     prepay = _num(m.get("prepayAmount")) + _num(m.get("fullPrepayAmount"))
-    # тип оплаты (из СПИСКА, дёшево):
-    #  задаток — примечание с «задаток» ИЛИ частичная предоплата (0 < prepay < total);
-    #  полная оплата — предоплата = полной сумме ИЛИ статус «Оплачен»;
-    #  иначе — накладений.
-    if _DEPOSIT_RX.search(desc):
-        pay, depAmt = "deposit", (_deposit_amount(desc) or int(prepay))
-    elif prepay > 0 and total > 0 and prepay >= round(total * 0.95):
-        pay, depAmt = "full", 0
-    elif 0 < prepay < total:
-        pay, depAmt = "deposit", int(prepay)
-    elif "оплач" in st_title.lower():
-        pay, depAmt = "full", 0
+    # тип оплаты (из СПИСКА): задаток — ТОЛЬКО слово «задаток/завдаток» + сумма в примечании.
+    # Полную оплату здесь НЕ определяем (она из SalesDrive «Оплачено» в build_ord). Предоплату/статус не смотрим.
+    dep_amt = _deposit_amount(desc)
+    if dep_amt > 0:
+        pay, depAmt = "deposit", dep_amt
     else:
         pay, depAmt = "cod", 0
     return {"total": total, "drop": drop, "gross": gross,
@@ -1592,7 +1597,7 @@ def build_pay_detail_index(md_orders, cap=None):
     # кэш классификаций {id: {ext, pay, dep}}
     cache = {}
     try:
-        cache = requests.get(f"{FIREBASE_DB_URL}/shop-reports/ads-pay-cache.json", timeout=40).json() or {}
+        cache = requests.get(f"{FIREBASE_DB_URL}/shop-reports/ads-pay-cache2.json", timeout=40).json() or {}
     except Exception:
         cache = {}
     # деталь тянем только для: новых (нет в кэше) ИЛИ свежих (дата >= cutoff — цвет/статус ещё меняется)
@@ -1624,7 +1629,7 @@ def build_pay_detail_index(md_orders, cap=None):
     cache.update(new_cache)
     if FIREBASE_DB_URL and new_cache:
         try:
-            requests.patch(f"{FIREBASE_DB_URL}/shop-reports/ads-pay-cache.json",
+            requests.patch(f"{FIREBASE_DB_URL}/shop-reports/ads-pay-cache2.json",
                            data=json.dumps(new_cache, ensure_ascii=False).encode("utf-8"),
                            headers={"Content-Type": "application/json"}, timeout=60)
         except Exception as e:
@@ -1671,9 +1676,11 @@ def update_website_margins(md_orders, days, pay_idx=None):
                     upd[oid] = None
                     continue
                 o2 = dict(o); changed = False
-                # ТИП ОПЛАТЫ — ставим ВСЕГДА по детали, независимо от маржи/статуса (покрываем весь месяц)
-                if pd and (o.get("pay") != pd[0] or o.get("depAmt") != pd[1]):
-                    o2["pay"] = pd[0]; o2["depAmt"] = pd[1]; changed = True
+                # ТИП ОПЛАТЫ: здесь только ЗАДАТОК (по примечанию MyDrop). «full» ставится в build_ord
+                # по SalesDrive «Оплачено» — его тут не трогаем (полный пересчёт делает build_ord).
+                if pd and pd[0] == "deposit" and _num(pd[1]) > 0:
+                    if o.get("pay") != "deposit" or o.get("depAmt") != pd[1]:
+                        o2["pay"] = "deposit"; o2["depAmt"] = pd[1]; changed = True
                 # МАРЖА/статусы — только если есть маржа в MyDrop (не перетираем нулём)
                 if isinstance(m, dict) and m.get("gross"):
                     ups = _num(o.get("upsSum"))
@@ -1900,7 +1907,7 @@ def find_and_add_missing(md_orders):
     if not FIREBASE_DB_URL:
         return
     try:
-        cache = requests.get(f"{FIREBASE_DB_URL}/shop-reports/ads-pay-cache.json", timeout=40).json() or {}
+        cache = requests.get(f"{FIREBASE_DB_URL}/shop-reports/ads-pay-cache2.json", timeout=40).json() or {}
     except Exception:
         cache = {}
     pay_days = int(os.environ.get("PAY_DAYS", "20"))
@@ -1972,11 +1979,22 @@ def find_and_add_missing(md_orders):
         if info.get("hidden"):
             continue
         ups = 0.0
+        # тип оплаты: задаток (примечание MyDrop / кэш детали / комментарий SD) → SD «Оплачено» → накладений
+        pay, depAmt = info.get("pay", "cod"), info.get("depAmt", 0)
+        if not (pay == "deposit" and _num(depAmt) > 0):
+            if c.get("pay") == "deposit" and _num(c.get("dep")) > 0:
+                pay, depAmt = "deposit", c.get("dep")
+            elif sd and _deposit_amount(extract(sd).get("comment")) > 0:
+                pay, depAmt = "deposit", _deposit_amount(extract(sd).get("comment"))
+            elif sd and _num(extract(sd).get("payed")) > 0:
+                pay, depAmt = "full", 0
+            else:
+                pay, depAmt = "cod", 0
         rec = {"catKey": catkey, "catName": catname, "camp": camp,
                "approved": info["approved"], "sold": info["sold"], "refused": info["refused"],
                "sum": info["total"], "upsSum": ups, "upsCount": 0,
                "margin": round(info["gross"], 2), "drop": info["drop"],
-               "pay": info.get("pay", "cod"), "depAmt": info.get("depAmt", 0),
+               "pay": pay, "depAmt": depAmt,
                "items": items, "ext": ext, "fromMD": 1}
         added.setdefault(src, {}).setdefault(day, {})[oid_key] = rec
         existing.add(ext)
