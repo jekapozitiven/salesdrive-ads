@@ -699,6 +699,13 @@ def build_ord(orders, mbe=None, mbe_ph=None, pay_idx=None):
         e = extract(x)
         if e["source"] not in WANTED_SOURCES:
             continue
+        # FB-метка из КАРТОЧКИ MyDrop (utmSource/«Источник заказа»): SalesDrive знает только UTM, поэтому
+        # заказ, который MyDrop считает Facebook, переносим в «…-FB», а из базового источника удаляем (None).
+        _moved_from = None
+        _pd0 = pay_idx.get(str(e["externalId"] or ""))
+        if _pd0 and len(_pd0) > 2 and _pd0[2] and e["source"] in ("Сайт-Black-street", "Хор-Blink"):
+            _moved_from = e["source"]
+            e["source"] = e["source"] + "-FB"
         day = e["date"]
         if not re.match(r"^\d{4}-\d{2}-\d{2}$", day or ""):
             continue
@@ -774,6 +781,8 @@ def build_ord(orders, mbe=None, mbe_ph=None, pay_idx=None):
             "margin": margin, "drop": drop, "pay": pay, "depAmt": depAmt,
             "items": items, "ext": str(e["externalId"] or ""),
         }
+        if _moved_from:
+            out.setdefault(fbkey(_moved_from), {}).setdefault(day, {}).setdefault(oid, None)
     return out
 
 
@@ -961,6 +970,22 @@ def _shop_from_source_title(title):
     if re.search(r"блін|блин|blink", t, re.I):
         return "Blink"
     return ""
+
+
+def _md_is_fb(d):
+    """FB-метка по КАРТОЧКЕ MyDrop (как в stats.py): utmSource/utm_source ИЛИ «Источник заказа» (orderSource)
+    содержит facebook/fb. SalesDrive знает только UTM, поэтому часть FB-заказов видна лишь здесь."""
+    if not isinstance(d, dict):
+        return False
+    parts = []
+    for k in ("utmSource", "utm_source"):
+        v = d.get(k)
+        if v not in (None, ""):
+            parts.append(str(v.get("title") if isinstance(v, dict) else v))
+    os_ = d.get("orderSource")
+    if os_ not in (None, ""):
+        parts.append(str(os_.get("title") if isinstance(os_, dict) else os_))
+    return bool(re.search(r"facebook|\bfb\b", " ".join(parts), re.I))
 
 
 def _src_from_mydrop_ordersource(title):
@@ -1618,14 +1643,14 @@ def build_pay_detail_index(md_orders, cap=None):
             os_ = d.get("orderSource")
             os_title = (os_.get("title") if isinstance(os_, dict) else os_) or ""
             src = _src_from_mydrop_ordersource(os_title)   # магазин-источник (Сайт-Black-street / Хор-Blink / Хор-Blink-FB)
-            return (mid, ext, pay, dep, src)
+            return (mid, ext, pay, dep, src, 1 if _md_is_fb(d) else 0)
         except Exception:
             return None
     new_cache = {}
     with ThreadPoolExecutor(max_workers=10) as ex:
         for r in ex.map(work, todo):
             if r:
-                new_cache[r[0]] = {"ext": r[1], "pay": r[2], "dep": r[3], "src": r[4], "day": id_date.get(r[0], "")}
+                new_cache[r[0]] = {"ext": r[1], "pay": r[2], "dep": r[3], "src": r[4], "day": id_date.get(r[0], ""), "fb": r[5]}
     cache.update(new_cache)
     if FIREBASE_DB_URL and new_cache:
         try:
@@ -1639,7 +1664,7 @@ def build_pay_detail_index(md_orders, cap=None):
     for mid in id_date:
         c = cache.get(mid)
         if c and c.get("ext"):
-            out[c["ext"]] = (c.get("pay", "cod"), c.get("dep", 0))
+            out[c["ext"]] = (c.get("pay", "cod"), c.get("dep", 0), 1 if c.get("fb") else 0)   # (pay, depAmt, fb-метка MyDrop)
     print(f"pay-detail: pay_idx готов на {len(out)} заказов")
     return out
 
