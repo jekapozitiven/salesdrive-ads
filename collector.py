@@ -632,6 +632,11 @@ def push_ads_firebase(agg):
 # Задаток проверяется первым (есть «завдаток 200» → задаток, даже если «Оплачено» заполнено).
 _DEPOSIT_RX = re.compile(r"(?:за[вй]?д[ао]т[оа]?к|zav?datok)[a-zа-яіїє]*[\s:\-–—=]*(\d{2,5})", re.I)
 _DEPOSIT_AMT_RX = _DEPOSIT_RX
+_DEPOSIT_WORD_RX = re.compile(r"за[вй]?д[ао]т[оа]?к|zav?datok", re.I)   # просто упоминание задатка (без суммы)
+
+def _deposit_mentioned(*texts):
+    """1, если в любом из текстов есть слово «задаток/завдаток» (с суммой или без)."""
+    return 1 if any(_DEPOSIT_WORD_RX.search(str(t or "")) for t in texts) else 0
 
 def _paytype(desc, status_title=None, sd_payed=0):
     """'deposit' | 'full' | 'cod': примечание (задаток+сумма) → SalesDrive «Оплачено» → накладений."""
@@ -654,7 +659,7 @@ def _find_deposit_note(obj, depth=0):
     if depth > 4:
         return None
     if isinstance(obj, str):
-        return obj if _DEPOSIT_RX.search(obj) else None
+        return obj if _DEPOSIT_WORD_RX.search(obj) else None
     if isinstance(obj, dict):
         for v in obj.values():
             r = _find_deposit_note(v, depth + 1)
@@ -783,6 +788,7 @@ def build_ord(orders, mbe=None, mbe_ph=None, pay_idx=None):
             "approved": approved, "sold": sold, "refused": refused,
             "sum": sale, "upsSum": ups, "upsCount": 1 if e["upsells"] else 0,
             "margin": margin, "drop": drop, "pay": pay, "depAmt": depAmt,
+            "depNote": 1 if (pay == "deposit" or (_pd0 and len(_pd0) > 3 and _pd0[3]) or (isinstance(m, dict) and m.get("depNote")) or _deposit_mentioned(e.get("comment"))) else 0,
             "items": items, "ext": str(e["externalId"] or ""),
         }
         if _moved_from:
@@ -1080,6 +1086,7 @@ def build_phone_bucket(md_orders):
             "camp": "", "shop": shop, "approved": appr, "sold": sold, "refused": refused,
             "sum": total, "upsSum": 0.0, "upsCount": 0, "margin": gross, "drop": drop,
             "pay": _pay_from_detail(dd, m)[0], "depAmt": _pay_from_detail(dd, m)[1],
+            "depNote": 1 if (_find_deposit_note(dd) or _find_deposit_note(m)) else 0,
             "items": items, "ext": ext, "phoneNum": phone_num, "phone": 1,
         }
     return out
@@ -1282,13 +1289,14 @@ def _md_margin_info(m):
     # тип оплаты (из СПИСКА): задаток — ТОЛЬКО слово «задаток/завдаток» + сумма в примечании.
     # Полную оплату здесь НЕ определяем (она из SalesDrive «Оплачено» в build_ord). Предоплату/статус не смотрим.
     dep_amt = _deposit_amount(desc)
+    dep_note = _deposit_mentioned(desc, m.get("privateDescription"))
     if dep_amt > 0:
         pay, depAmt = "deposit", dep_amt
     else:
         pay, depAmt = "cod", 0
     return {"total": total, "drop": drop, "gross": gross,
             "approved": appr, "sold": sold, "refused": refused, "hidden": _md_hidden(m),
-            "pay": pay, "depAmt": depAmt,
+            "pay": pay, "depAmt": depAmt, "depNote": dep_note,
             "prepay": prepay, "delivPay": _num(m.get("deliveryPayment"))}
 
 
@@ -1650,14 +1658,14 @@ def build_pay_detail_index(md_orders, cap=None):
             os_ = d.get("orderSource")
             os_title = (os_.get("title") if isinstance(os_, dict) else os_) or ""
             src = _src_from_mydrop_ordersource(os_title)   # магазин-источник (Сайт-Black-street / Хор-Blink / Хор-Blink-FB)
-            return (mid, ext, pay, dep, src, 1 if _md_is_fb(d) else 0)
+            return (mid, ext, pay, dep, src, 1 if _md_is_fb(d) else 0, 1 if _find_deposit_note(d) else 0)
         except Exception:
             return None
     new_cache = {}
     with ThreadPoolExecutor(max_workers=10) as ex:
         for r in ex.map(work, todo):
             if r:
-                new_cache[r[0]] = {"ext": r[1], "pay": r[2], "dep": r[3], "src": r[4], "day": id_date.get(r[0], ""), "fb": r[5]}
+                new_cache[r[0]] = {"ext": r[1], "pay": r[2], "dep": r[3], "src": r[4], "day": id_date.get(r[0], ""), "fb": r[5], "dn": r[6]}
     cache.update(new_cache)
     if FIREBASE_DB_URL and new_cache:
         try:
@@ -1671,7 +1679,7 @@ def build_pay_detail_index(md_orders, cap=None):
     for mid in id_date:
         c = cache.get(mid)
         if c and c.get("ext"):
-            out[c["ext"]] = (c.get("pay", "cod"), c.get("dep", 0), 1 if c.get("fb") else 0)   # (pay, depAmt, fb-метка MyDrop)
+            out[c["ext"]] = (c.get("pay", "cod"), c.get("dep", 0), 1 if c.get("fb") else 0, 1 if c.get("dn") else 0)   # (pay, depAmt, fb, упоминание задатка)
     print(f"pay-detail: pay_idx готов на {len(out)} заказов")
     return out
 
@@ -2032,7 +2040,7 @@ def find_and_add_missing(md_orders):
                "approved": info["approved"], "sold": info["sold"], "refused": info["refused"],
                "sum": round(_num(info["total"]) + _dep, 2), "upsSum": ups, "upsCount": 0,
                "margin": round(info["gross"] + _dep, 2), "drop": info["drop"],
-               "pay": pay, "depAmt": depAmt,
+               "pay": pay, "depAmt": depAmt, "depNote": 1 if (pay == "deposit" or info.get("depNote") or c.get("dn")) else 0,
                "items": items, "ext": ext, "fromMD": 1}
         added.setdefault(src, {}).setdefault(day, {})[oid_key] = rec
         existing.add(ext)
