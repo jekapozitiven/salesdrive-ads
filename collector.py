@@ -773,6 +773,10 @@ def build_ord(orders, mbe=None, mbe_ph=None, pay_idx=None):
             pay, depAmt = "full", 0
         else:
             pay, depAmt = "cod", 0
+        # ЗАДАТОК: заказ в MyDrop оформлен на сумму минус задаток → возвращаем его в продажну и маржу
+        # апрувнутого заказа (по отказам тоже — задаток остаётся у нас, перекрывает доставку).
+        if pay == "deposit" and approved and _num(depAmt) > 0:
+            sale = round(sale + _num(depAmt), 2); margin = round(margin + _num(depAmt), 2)
         camp = (e.get("utmCampaign") or "") if e["source"].endswith("-FB") else camp_of(e["source"], [it.get("name") for it in items])
         out.setdefault(fbkey(e["source"]), {}).setdefault(day, {})[oid] = {
             "catKey": catkey, "catName": catname, "camp": camp,
@@ -1049,6 +1053,9 @@ def build_phone_bucket(md_orders):
         drop = _num(m.get("dropPrice"))
         appr, sold, refused = _md_flags(m)
         gross = round(total - drop, 2) if appr else 0.0
+        _pay_ph = _pay_from_detail(dd, m)
+        if _pay_ph[0] == "deposit" and appr and _num(_pay_ph[1]) > 0:   # задаток → в продажну/маржу
+            total = round(total + _num(_pay_ph[1]), 2); gross = round(gross + _num(_pay_ph[1]), 2)
         # номер как в CRM (index) и телефон клиента — из карточки, с фолбэком на список
         ext = str(dd.get("index") or m.get("index") or m.get("id") or "")
         phone_num = str(dd.get("phone") or m.get("phone") or "").strip()
@@ -1710,7 +1717,12 @@ def update_website_margins(md_orders, days, pay_idx=None):
                 if isinstance(m, dict) and m.get("gross"):
                     ups = _num(o.get("upsSum"))
                     sale = round(max(_num(m.get("total")) - ups, 0.0), 2) or o.get("sum")
-                    o2.update({"margin": round(m["gross"], 2), "drop": m["drop"], "sum": sale,
+                    gross = round(m["gross"], 2)
+                    # задаток возвращаем в продажну/маржу (как в build_ord)
+                    _dep = _num(o2.get("depAmt")) if o2.get("pay") == "deposit" else 0
+                    if _dep > 0 and m["approved"]:
+                        sale = round(_num(sale) + _dep, 2); gross = round(gross + _dep, 2)
+                    o2.update({"margin": gross, "drop": m["drop"], "sum": sale,
                                "approved": m["approved"], "sold": m["sold"], "refused": m["refused"]})
                     changed = True
                 if changed:
@@ -2015,10 +2027,11 @@ def find_and_add_missing(md_orders):
                 pay, depAmt = "full", 0
             else:
                 pay, depAmt = "cod", 0
+        _dep = _num(depAmt) if (pay == "deposit" and info["approved"]) else 0   # задаток → в продажну/маржу
         rec = {"catKey": catkey, "catName": catname, "camp": camp,
                "approved": info["approved"], "sold": info["sold"], "refused": info["refused"],
-               "sum": info["total"], "upsSum": ups, "upsCount": 0,
-               "margin": round(info["gross"], 2), "drop": info["drop"],
+               "sum": round(_num(info["total"]) + _dep, 2), "upsSum": ups, "upsCount": 0,
+               "margin": round(info["gross"] + _dep, 2), "drop": info["drop"],
                "pay": pay, "depAmt": depAmt,
                "items": items, "ext": ext, "fromMD": 1}
         added.setdefault(src, {}).setdefault(day, {})[oid_key] = rec
