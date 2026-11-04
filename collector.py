@@ -1094,6 +1094,37 @@ def build_phone_bucket(md_orders):
     return out
 
 
+def sync_pay_to_cache(ordtree):
+    """Итоговый тип оплаты (с учётом SalesDrive «Оплачено» → full) и флаг упоминания задатка пишем
+    обратно в ads-pay-cache2/<MyDrop id> — его читает портал «Звіти» (блок «Оплата, викуп» по магазинах)."""
+    if not FIREBASE_DB_URL:
+        return
+    cache = requests.get(f"{FIREBASE_DB_URL}/shop-reports/ads-pay-cache2.json", timeout=60).json() or {}
+    by_ext = {}
+    for mid, c in cache.items():
+        if isinstance(c, dict) and c.get("ext"):
+            by_ext[str(c["ext"])] = (mid, c)
+    upd = {}
+    for src, days in ordtree.items():
+        for day, ords in days.items():
+            for oid, o in ords.items():
+                if not isinstance(o, dict) or not o.get("ext"):
+                    continue
+                hit = by_ext.get(str(o["ext"]))
+                if not hit:
+                    continue
+                mid, c = hit
+                pay, dep, dn = o.get("pay", "cod"), o.get("depAmt", 0), 1 if o.get("depNote") else 0
+                if c.get("pay") != pay or c.get("dep") != dep or (c.get("dn") or 0) != dn:
+                    upd[mid] = {"pay": pay, "dep": dep, "dn": dn}
+    if upd:
+        payload = {f"{mid}/{k}": v for mid, d in upd.items() for k, v in d.items()}
+        requests.patch(f"{FIREBASE_DB_URL}/shop-reports/ads-pay-cache2.json",
+                       data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                       headers={"Content-Type": "application/json"}, timeout=60)
+    print(f"pay-cache sync: обновлено {len(upd)} записей")
+
+
 def push_ord_firebase(ordtree):
     """PATCH пер-заказной детализации ПО ДНЯМ в ads-ord/<src>/<day> — мерж (не стираем свежие из вебхука),
     история навсегда (старые дни не трогаем)."""
@@ -2242,6 +2273,10 @@ def main():
         print(f"Кампания по артикулу: сматчено {_cov_c}/{_cov_t} заказов")
         push_ord_firebase(ordtree)
         reaggregate_ads_from_ord(ordtree)
+        try:
+            sync_pay_to_cache(ordtree)
+        except Exception as _e:
+            print(f"pay-cache sync: {_e}")
     except Exception as e:
         print(f"ads-ord: {e}")
         push_ads_firebase(agg)   # запасной путь, если поордерная сборка упала
