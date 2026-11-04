@@ -789,6 +789,7 @@ def build_ord(orders, mbe=None, mbe_ph=None, pay_idx=None):
             "sum": sale, "upsSum": ups, "upsCount": 1 if e["upsells"] else 0,
             "margin": margin, "drop": drop, "pay": pay, "depAmt": depAmt,
             "depNote": 1 if (pay == "deposit" or (_pd0 and len(_pd0) > 3 and _pd0[3]) or (isinstance(m, dict) and m.get("depNote")) or _deposit_mentioned(e.get("comment"))) else 0,
+            "notCounted": 1 if (isinstance(m, dict) and m.get("notCounted")) else 0,
             "items": items, "ext": str(e["externalId"] or ""),
         }
         if _moved_from:
@@ -1087,6 +1088,7 @@ def build_phone_bucket(md_orders):
             "sum": total, "upsSum": 0.0, "upsCount": 0, "margin": gross, "drop": drop,
             "pay": _pay_from_detail(dd, m)[0], "depAmt": _pay_from_detail(dd, m)[1],
             "depNote": 1 if (_find_deposit_note(dd) or _find_deposit_note(m)) else 0,
+            "notCounted": 1 if "не учит" in str((m.get("orderStatus") or {}).get("title") or "").lower() else 0,
             "items": items, "ext": ext, "phoneNum": phone_num, "phone": 1,
         }
     return out
@@ -1297,6 +1299,7 @@ def _md_margin_info(m):
     return {"total": total, "drop": drop, "gross": gross,
             "approved": appr, "sold": sold, "refused": refused, "hidden": _md_hidden(m),
             "pay": pay, "depAmt": depAmt, "depNote": dep_note,
+            "notCounted": 1 if "не учит" in st_title.strip().lower() else 0,   # статус «Не учитываем»
             "prepay": prepay, "delivPay": _num(m.get("deliveryPayment"))}
 
 
@@ -2041,6 +2044,7 @@ def find_and_add_missing(md_orders):
                "sum": round(_num(info["total"]) + _dep, 2), "upsSum": ups, "upsCount": 0,
                "margin": round(info["gross"] + _dep, 2), "drop": info["drop"],
                "pay": pay, "depAmt": depAmt, "depNote": 1 if (pay == "deposit" or info.get("depNote") or c.get("dn")) else 0,
+               "notCounted": 1 if info.get("notCounted") else 0,
                "items": items, "ext": ext, "fromMD": 1}
         added.setdefault(src, {}).setdefault(day, {})[oid_key] = rec
         existing.add(ext)
