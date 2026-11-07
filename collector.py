@@ -2173,7 +2173,25 @@ def _phone_detail_debug(md_orders):
     print(f"phone-detail-debug: HTTP {r.status_code}, карточек {len(samples)}; ответ: {r.text[:200]}")
 
 
+# ВЕРСИЯ СБОРЩИКА. Пишется в Firebase shop-reports/versions/ads при каждом запуске — портал «Звіти»
+# сравнивает с требуемой и показывает красную плашку, если на сервере стоит старая копия.
+COLLECTOR_VERSION = "2026-11-07.1"
+
+
+def report_version(job):
+    if not FIREBASE_DB_URL:
+        return
+    try:
+        requests.put(f"{FIREBASE_DB_URL}/shop-reports/versions/{job}.json",
+                     data=json.dumps({"ver": COLLECTOR_VERSION, "at": dt.datetime.utcnow().isoformat(timespec="seconds") + "Z"}).encode("utf-8"),
+                     headers={"Content-Type": "application/json"}, timeout=20)
+        print(f"version: collector {COLLECTOR_VERSION}")
+    except Exception as e:
+        print(f"version: {e}")
+
+
 def main():
+    report_version("phone" if os.environ.get("SD_PHONE_ONLY", "").strip() in ("1", "true", "yes") else "ads")
     if os.environ.get("SD_PHONE_ONLY", "").strip() in ("1", "true", "yes"):
         phone_only_run()
         return
