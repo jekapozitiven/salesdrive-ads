@@ -2175,7 +2175,7 @@ def _phone_detail_debug(md_orders):
 
 # ВЕРСИЯ СБОРЩИКА. Пишется в Firebase shop-reports/versions/ads при каждом запуске — портал «Звіти»
 # сравнивает с требуемой и показывает красную плашку, если на сервере стоит старая копия.
-COLLECTOR_VERSION = "2026-11-07.1"
+COLLECTOR_VERSION = "2026-11-09.1"
 
 
 def report_version(job):
@@ -2295,6 +2295,10 @@ def main():
             sync_pay_to_cache(ordtree)
         except Exception as _e:
             print(f"pay-cache sync: {_e}")
+        try:
+            fetch_returns()   # возвраты из Google-таблицы -> Firebase (раньше только в задаче phone, которая на сервере не запускалась)
+        except Exception as _e:
+            print(f"returns: {_e}")
     except Exception as e:
         print(f"ads-ord: {e}")
         push_ads_firebase(agg)   # запасной путь, если поордерная сборка упала
