@@ -761,6 +761,16 @@ def build_ord(orders, mbe=None, mbe_ph=None, pay_idx=None):
             sale = round(max(_num(m.get("total")) - ups, 0.0), 2) or e["mainSum"]
             pay = m.get("pay", "cod"); depAmt = m.get("depAmt", 0)   # задаток по списку MyDrop (слово+сумма)
         else:
+            # Заказа НЕТ в MyDrop (не передан / удалён / дубль). MyDrop — источник правды для «заявок»,
+            # поэтому заказ старше 1 дня без пары в MyDrop из трекера убираем (None = удалить), чтобы
+            # трекер сходился со «Звіти» и с CRM. Свежие (сегодня/вчера) оставляем — MyDrop ещё не успел.
+            try:
+                _dday = dt.date.fromisoformat(day)
+            except Exception:
+                _dday = dt.date.today()
+            if (dt.date.today() - _dday).days >= 2:
+                out.setdefault(fbkey(e["source"]), {}).setdefault(day, {})[oid] = None
+                continue
             margin = ups; drop = 0.0; sold = 0; refused = 0   # без MyDrop: хотя бы допрод-маржа
             approved = 1 if str(x.get("statusId")) in APRUV_STATUS else 0
             sale = e["mainSum"]
@@ -993,9 +1003,10 @@ def _md_is_fb(d):
         v = d.get(k)
         if v not in (None, ""):
             parts.append(str(v.get("title") if isinstance(v, dict) else v))
-    os_ = d.get("orderSource")
-    if os_ not in (None, ""):
-        parts.append(str(os_.get("title") if isinstance(os_, dict) else os_))
+    for k in ("orderSource", "trafficSource", "traffic_source"):
+        v = d.get(k)
+        if v not in (None, ""):
+            parts.append(str(v.get("title") if isinstance(v, dict) else v))
     return bool(re.search(r"facebook|\bfb\b", " ".join(parts), re.I))
 
 
@@ -1709,11 +1720,25 @@ def build_pay_detail_index(md_orders, cap=None):
         except Exception as e:
             print(f"pay-cache: {e}")
     # собрать pay_idx по всем заказам месяца (из кэша)
+    # ИСТОЧНИК ЗАКАЗА — из shop-reports/mydrop-order-loc/<MyDrop id> (пишет stats.py, та же классификация,
+    # что в «Звіти по магазинах»): если там Black-facebook / Blink-facebook — это FB-заказ. Так трекер и Звіти
+    # никогда не разойдутся по тому, какой заказ считать Facebook.
+    loc = {}
+    try:
+        loc = requests.get(f"{FIREBASE_DB_URL}/shop-reports/mydrop-order-loc.json", timeout=60).json() or {}
+    except Exception as e:
+        print(f"order-loc: {e}")
     out = {}
+    fb_loc = 0
     for mid in id_date:
         c = cache.get(mid)
         if c and c.get("ext"):
-            out[c["ext"]] = (c.get("pay", "cod"), c.get("dep", 0), 1 if c.get("fb") else 0, 1 if c.get("dn") else 0)   # (pay, depAmt, fb, упоминание задатка)
+            lsrc = str((loc.get(str(mid)) or {}).get("src") or "")
+            fb = 1 if ("facebook" in lsrc.lower() or c.get("fb")) else 0
+            if "facebook" in lsrc.lower():
+                fb_loc += 1
+            out[c["ext"]] = (c.get("pay", "cod"), c.get("dep", 0), fb, 1 if c.get("dn") else 0)   # (pay, depAmt, fb, упоминание задатка)
+    print(f"pay-detail: FB по order-loc (MyDrop «Ист. трафика»): {fb_loc}")
     print(f"pay-detail: pay_idx готов на {len(out)} заказов")
     return out
 
@@ -2175,7 +2200,7 @@ def _phone_detail_debug(md_orders):
 
 # ВЕРСИЯ СБОРЩИКА. Пишется в Firebase shop-reports/versions/ads при каждом запуске — портал «Звіти»
 # сравнивает с требуемой и показывает красную плашку, если на сервере стоит старая копия.
-COLLECTOR_VERSION = "2026-11-09.1"
+COLLECTOR_VERSION = "2026-11-09.2"
 
 
 def report_version(job):
