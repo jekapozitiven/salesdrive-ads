@@ -360,10 +360,18 @@ def orders_from(resp):
     return []
 
 
+SD_META_FIELDS = {}   # meta.fields из ответа /api/order/list/ (ключ поля -> {label,type,...}) — для поиска «Сами оформили»
+
+
 def fetch_all(date_from):
+    global SD_META_FIELDS
     out, page = [], 1
     while page <= MAX_PAGES:
         resp = fetch_page(page, date_from)
+        if isinstance(resp, dict) and not SD_META_FIELDS:
+            _mf = (resp.get("meta") or {}).get("fields")
+            if isinstance(_mf, dict):
+                SD_META_FIELDS = _mf
         batch = orders_from(resp)
         out += batch
         meta = resp if isinstance(resp, dict) else {}
@@ -802,6 +810,8 @@ def build_ord(orders, mbe=None, mbe_ph=None, pay_idx=None):
             "notCounted": 1 if (isinstance(m, dict) and m.get("notCounted")) else 0,
             "items": items, "ext": str(e["externalId"] or ""),
         }
+        if SD_SELF_KEY:   # «Сами оформили» (SalesDrive): 1 = оформили мы, 0 = КЦ
+            out[fbkey(e["source"])][day][oid]["self"] = _sd_self_val(x.get(SD_SELF_KEY))
         if _moved_from:
             out.setdefault(fbkey(_moved_from), {}).setdefault(day, {}).setdefault(oid, None)
     return out
@@ -1136,6 +1146,88 @@ def sync_pay_to_cache(ordtree):
     print(f"pay-cache sync: обновлено {len(upd)} записей")
 
 
+# ─── «Сами оформили» (SalesDrive, галочка): есть = заказ оформили МЫ, пусто = колл-центр ───
+# Ключ поля: env SD_SELF_FIELD, иначе по подписи в meta.fields («…оформил…»), иначе по имени ключа (samiOformili…).
+# Пишем: ads-ord/<src>/<day>/<oid>.self и ads-pay-cache2/<MyDrop id>.self (0/1) — портал «Звіти» считает «ми / КЦ» от апрува.
+# Диагностика: shop-reports/sd-self-probe (какое поле нашлось, какие значения).
+SD_SELF_KEY = None
+_SELF_RE = re.compile(r"^sam[iy]?_?oform", re.I)
+
+
+def _sd_self_val(v):
+    if v is None or v is False:
+        return 0
+    if isinstance(v, (list, dict)):
+        return 1 if v else 0
+    s = str(v).strip().lower()
+    return 0 if s in ("", "0", "false", "null", "none", "ні", "нет", "no") else 1
+
+
+def detect_self_key(orders):
+    """Находит ключ поля «Сами оформили» в заказах SalesDrive. Возвращает (key, label, type, how)."""
+    env = os.environ.get("SD_SELF_FIELD", "").strip()
+    if env:
+        f = SD_META_FIELDS.get(env) or {}
+        return env, f.get("label"), f.get("type"), "env"
+    for k, f in (SD_META_FIELDS or {}).items():
+        lab = str((f or {}).get("label") or "").lower()
+        if "оформил" in lab and ("сам" in lab):
+            return k, f.get("label"), f.get("type"), "meta-label"
+    keys = set()
+    for o in orders[:3000]:
+        if isinstance(o, dict):
+            keys.update(o.keys())
+    for k in sorted(keys):
+        if _SELF_RE.match(str(k)):
+            f = SD_META_FIELDS.get(k) or {}
+            return k, f.get("label"), f.get("type"), "key-name"
+    return None, None, None, "not-found"
+
+
+def sync_self_to_cache(orders, key, info):
+    """Признак «Сами оформили» -> ads-pay-cache2/<MyDrop id>.self (матч по externalId, как тип оплаты)
+    + диагностика в shop-reports/sd-self-probe."""
+    if not FIREBASE_DB_URL:
+        return
+    hist = Counter()
+    self_by_ext = {}
+    for o in orders:
+        if not isinstance(o, dict):
+            continue
+        raw = o.get(key) if key else None
+        hist[json.dumps(raw, ensure_ascii=False)[:40]] += 1
+        ext = str(o.get("externalId") or "").strip()
+        if key and ext and ext != "-":
+            self_by_ext[ext] = _sd_self_val(raw)
+    upd = {}
+    if key:
+        cache = requests.get(f"{FIREBASE_DB_URL}/shop-reports/ads-pay-cache2.json", timeout=60).json() or {}
+        for mid, c in cache.items():
+            if not isinstance(c, dict):
+                continue
+            ext = str(c.get("ext") or "")
+            if ext in self_by_ext and c.get("self") != self_by_ext[ext]:
+                upd[f"{mid}/self"] = self_by_ext[ext]
+        if upd:
+            requests.patch(f"{FIREBASE_DB_URL}/shop-reports/ads-pay-cache2.json",
+                           data=json.dumps(upd, ensure_ascii=False).encode("utf-8"),
+                           headers={"Content-Type": "application/json"}, timeout=60)
+    probe_doc = {"at": dt.datetime.utcnow().isoformat(timespec="seconds") + "Z", "ver": COLLECTOR_VERSION,
+                 "key": key, "label": info[0], "type": info[1], "how": info[2],
+                 "orders": len(orders), "self1": sum(1 for v in self_by_ext.values() if v),
+                 "withExt": len(self_by_ext), "cacheUpdated": len(upd),
+                 "values": dict(hist.most_common(12))}
+    if not key:   # поле не нашли — выпишем подписи всех полей meta, чтобы найти глазами
+        probe_doc["metaLabels"] = {k: str((f or {}).get("label") or "") for k, f in (SD_META_FIELDS or {}).items()}
+    probe_doc = {re.sub(r"[.#$\[\]/]", "_", k) if isinstance(k, str) else k: v for k, v in probe_doc.items()}
+    probe_doc["values"] = {re.sub(r"[.#$\[\]/]", "_", k): v for k, v in probe_doc["values"].items()}
+    requests.put(f"{FIREBASE_DB_URL}/shop-reports/sd-self-probe.json",
+                 data=json.dumps(probe_doc, ensure_ascii=False).encode("utf-8"),
+                 headers={"Content-Type": "application/json"}, timeout=40)
+    print(f"self-flag: поле {key!r} ({info[2]}), заказов SD {len(orders)}, с номером {len(self_by_ext)}, "
+          f"«сами» {probe_doc['self1']}, ads-pay-cache2 обновлено {len(upd)}")
+
+
 def push_ord_firebase(ordtree):
     """PATCH пер-заказной детализации ПО ДНЯМ в ads-ord/<src>/<day> — мерж (не стираем свежие из вебхука),
     история навсегда (старые дни не трогаем)."""
@@ -1372,6 +1464,11 @@ def build_margin_index(md_orders, with_pay=False):
         except Exception:
             pass
     ids = [str(m.get("id")) for m in md_orders if m.get("id")]
+    # дата заказа — чтобы НЕ перечитывать каждый прогон карточки старых заказов без номера
+    # (телефонные/Prom без externalId): старше NOEXT_FRESH_DAYS помечаем в кэше "-" = номера нет.
+    noext_fresh = int(os.environ.get("NOEXT_FRESH_DAYS", "3"))
+    cutoff = (dt.date.today() - dt.timedelta(days=noext_fresh)).isoformat()
+    day_of = {str(m.get("id")): str(m.get("dateTime") or m.get("date") or "")[:10] for m in md_orders if m.get("id")}
     missing = [i for i in ids if i not in cache]
     cap = int(os.environ.get("MD_DETAIL_CAP", "700"))
     missing = missing[:cap]
@@ -1379,12 +1476,14 @@ def build_margin_index(md_orders, with_pay=False):
     if missing:
         def work(i):
             return i, _extnum(mydrop_detail(i, headers))
-        new = {}
-        with ThreadPoolExecutor(max_workers=10) as ex:
+        new = {}; neg = 0
+        with ThreadPoolExecutor(max_workers=16) as ex:
             for i, ext in ex.map(work, missing):
                 if ext:
                     cache[i] = ext; new[i] = ext
-        print(f"  новых номеров закэшировано: {len(new)}")
+                elif day_of.get(i) and day_of[i] < cutoff:
+                    cache[i] = "-"; new[i] = "-"; neg += 1     # старый заказ без номера — больше не запрашиваем
+        print(f"  новых номеров закэшировано: {len(new) - neg}, старых без номера помечено: {neg}")
         if FIREBASE_DB_URL and new:
             try:
                 requests.patch(f"{FIREBASE_DB_URL}/shop-reports/ads-md-index.json",
@@ -1395,7 +1494,7 @@ def build_margin_index(md_orders, with_pay=False):
     mbe = {}
     for m in md_orders:
         ext = cache.get(str(m.get("id")))
-        if ext:
+        if ext and ext != "-":
             mbe[ext] = _md_margin_info(m)   # внутри уже есть pay/depAmt из списка
     return mbe
 
@@ -1661,7 +1760,7 @@ def build_pay_detail_index(md_orders, cap=None):
     from concurrent.futures import ThreadPoolExecutor
     cap = cap if cap is not None else int(os.environ.get("MD_PAY_CAP", "4000"))
     pay_days = int(os.environ.get("PAY_DAYS", "20"))
-    fresh_days = int(os.environ.get("PAY_FRESH_DAYS", "6"))
+    fresh_days = int(os.environ.get("PAY_FRESH_DAYS", "3"))   # карточку перечитываем 3 дня: статус берём из списка, карточка нужна ради примечания
     headers = {"X-API-KEY": MYDROP_KEY, "Accept": "application/json"}
     today = dt.date.today()
     fresh_cutoff = (today - dt.timedelta(days=fresh_days)).isoformat()
@@ -1707,10 +1806,13 @@ def build_pay_detail_index(md_orders, cap=None):
         except Exception:
             return None
     new_cache = {}
-    with ThreadPoolExecutor(max_workers=10) as ex:
+    with ThreadPoolExecutor(max_workers=16) as ex:
         for r in ex.map(work, todo):
             if r:
                 new_cache[r[0]] = {"ext": r[1], "pay": r[2], "dep": r[3], "src": r[4], "day": id_date.get(r[0], ""), "fb": r[5], "dn": r[6]}
+                _old = cache.get(r[0])
+                if isinstance(_old, dict) and "self" in _old and str(_old.get("ext") or "") == str(r[1]):
+                    new_cache[r[0]]["self"] = _old["self"]   # «Сами оформили» не теряем при перезаписи записи
     cache.update(new_cache)
     if FIREBASE_DB_URL and new_cache:
         try:
@@ -1922,7 +2024,7 @@ def _detail_sample_debug(md_orders, n=24):
         except Exception:
             return None
     out = []
-    with ThreadPoolExecutor(max_workers=10) as ex:
+    with ThreadPoolExecutor(max_workers=16) as ex:
         for r in ex.map(one, ids):
             if r:
                 out.append(r)
@@ -2200,7 +2302,56 @@ def _phone_detail_debug(md_orders):
 
 # ВЕРСИЯ СБОРЩИКА. Пишется в Firebase shop-reports/versions/ads при каждом запуске — портал «Звіти»
 # сравнивает с требуемой и показывает красную плашку, если на сервере стоит старая копия.
-COLLECTOR_VERSION = "2026-11-09.2"
+COLLECTOR_VERSION = "2026-11-17.1"
+
+
+
+# ──────────────────────────── САМООБНОВЛЕНИЕ ────────────────────────────
+# Чат портала публикует новую версию скрипта в Firebase: shop-reports/scripts/{job} = {ver, code (gzip+base64), sig}.
+# При запуске: если ver новее встроенной — проверяем HMAC-SHA256 подпись (ключ ниже; без него код не выполнится),
+# сохраняем во временный файл и перезапускаемся на нём. Владельцу больше не нужно ставить zip ради правок скрипта.
+# Отключить: переменная окружения NO_SELF_UPDATE=1.
+# Ключ подписи НЕ хранится в GitHub (репо публичный): env SELF_UPDATE_KEY или файл .selfupdate-key рядом со скриптом
+# (кладётся в пакет на сервер отдельно). Нет ключа — самообновление просто выключено.
+def _load_self_update_key():
+    k = os.environ.get("SELF_UPDATE_KEY", "").strip()
+    if k:
+        return k
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".selfupdate-key"), encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+SELF_UPDATE_KEY = _load_self_update_key()
+
+def self_update(node, current_version, name):
+    import subprocess, base64, gzip, hmac, hashlib
+    if not FIREBASE_DB_URL or not SELF_UPDATE_KEY or os.environ.get("NO_SELF_UPDATE", "").strip() == "1":
+        return
+    try:
+        r = requests.get(f"{FIREBASE_DB_URL}/shop-reports/scripts/{node}.json", timeout=20)
+        meta = r.json() if r.status_code == 200 else None
+        if not isinstance(meta, dict) or not meta.get("ver") or not meta.get("code") or not meta.get("sig"):
+            return
+        if str(meta["ver"]) <= str(current_version):
+            return
+        raw = base64.b64decode(meta["code"])
+        sig = hmac.new(SELF_UPDATE_KEY.encode("utf-8"), raw, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, str(meta["sig"])):
+            print(f"self-update: подпись версии {meta['ver']} не совпала — игнорирую"); return
+        code = gzip.decompress(raw)
+        compile(code, name, "exec")
+        path = os.path.join(os.getcwd(), name)
+        with open(path, "wb") as f:
+            f.write(code)
+        print(f"self-update: {current_version} -> {meta['ver']}, перезапускаюсь на новой версии"); sys.stdout.flush()
+        env = dict(os.environ); env["NO_SELF_UPDATE"] = "1"
+        rc = subprocess.call([sys.executable, "-u", path], env=env)
+        sys.exit(rc)
+    except SystemExit:
+        raise
+    except Exception as e:
+        print(f"self-update: {e}")
 
 
 def report_version(job):
@@ -2216,6 +2367,7 @@ def report_version(job):
 
 
 def main():
+    self_update("collector", COLLECTOR_VERSION, "collector_remote.py")
     report_version("phone" if os.environ.get("SD_PHONE_ONLY", "").strip() in ("1", "true", "yes") else "ads")
     if os.environ.get("SD_PHONE_ONLY", "").strip() in ("1", "true", "yes"):
         phone_only_run()
@@ -2234,6 +2386,14 @@ def main():
 
     orders = fetch_all(date_from)
     print(f"Всего заказов за период: {len(orders)}")
+    global SD_SELF_KEY
+    _self_info = (None, None, "not-found")
+    try:
+        SD_SELF_KEY, _sl, _st, _how = detect_self_key(orders)
+        _self_info = (_sl, _st, _how)
+        print(f"self-flag: ключ поля «Сами оформили» = {SD_SELF_KEY!r} ({_how}, {_sl!r}, {_st!r})")
+    except Exception as e:
+        print(f"self-flag detect: {e}"); SD_SELF_KEY = None
     try:
         _fb_field_probe(orders)   # ДИАГНОСТИКА: в каком поле SalesDrive лежит «fb» (для источника Blink-FB)
     except Exception as e:
@@ -2320,6 +2480,10 @@ def main():
             sync_pay_to_cache(ordtree)
         except Exception as _e:
             print(f"pay-cache sync: {_e}")
+        try:
+            sync_self_to_cache(orders, SD_SELF_KEY, _self_info)
+        except Exception as _e:
+            print(f"self-flag sync: {_e}")
         try:
             fetch_returns()   # возвраты из Google-таблицы -> Firebase (раньше только в задаче phone, которая на сервере не запускалась)
         except Exception as _e:
