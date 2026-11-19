@@ -1321,8 +1321,76 @@ MARGIN_KEYS = ("realMargin", "margin", "real_margin")
 MD_MAX_PAGES = int(os.environ.get("MD_MAX_PAGES", "500"))
 
 
+# ──────────────── РЕЖИМ ПРОГОНА: частый (7 дн.) / ночной полный (35 дн.) ────────────────
+# Решение владельца 19.11: частые прогоны по расписанию смотрят максимум 7 последних дней;
+# раз в сутки ночью (Киев, MD_FULL_HOURS, по умолчанию 1–3 ч) — один полный прогон за 35 дней.
+# Старые дни в Firebase не трогаются частым прогоном — «Звіти»/трекер берут их из уже записанных данных.
+# Отметка «полный сегодня был» — файл в рабочей папке задачи (data/ads, data/phone — том docker),
+# ставится только после успешного полного прогона (оборванный — повторится в ту же ночь).
+# Принудительно: MD_FULL=1 (полный) / MD_FULL=0 (частый).
+FAST_DAYS = int(os.environ.get("MD_FAST_DAYS", "7"))
+FULL_DAYS = int(os.environ.get("MD_FULL_DAYS", "35"))
+
+
+def _kyiv_now():
+    try:
+        from zoneinfo import ZoneInfo
+        return dt.datetime.now(ZoneInfo("Europe/Kyiv"))
+    except Exception:
+        return dt.datetime.utcnow() + dt.timedelta(hours=2)
+
+
+def _full_marker(job):
+    return os.path.join(os.getcwd(), f".full-run-{job}.json")
+
+
+def run_mode(job):
+    """'full' или 'fast' для задачи job ('ads'/'phone')."""
+    f = os.environ.get("MD_FULL", "").strip().lower()
+    if f in ("1", "true", "yes"):
+        return "full"
+    if f in ("0", "false", "no"):
+        return "fast"
+    now = _kyiv_now()
+    try:
+        h1, h2 = [int(x) for x in os.environ.get("MD_FULL_HOURS", "1-3").split("-")]
+    except Exception:
+        h1, h2 = 1, 3
+    if not (h1 <= now.hour < h2):
+        return "fast"
+    try:
+        with open(_full_marker(job), encoding="utf-8") as fh:
+            last = (json.load(fh) or {}).get("day")
+    except Exception:
+        last = None
+    return "fast" if last == now.date().isoformat() else "full"
+
+
+def mark_full_done(job):
+    try:
+        with open(_full_marker(job), "w", encoding="utf-8") as fh:
+            json.dump({"day": _kyiv_now().date().isoformat(), "at": dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                       "ver": COLLECTOR_VERSION}, fh)
+    except Exception as e:
+        print(f"run-mode: отметка полного прогона не записана: {e}")
+
+
+def _md_day(m):
+    """Дата заказа MyDrop YYYY-MM-DD из списка ('' если нет)."""
+    d = str((m.get("dateTime") or m.get("date") or "") if isinstance(m, dict) else "")[:10]
+    return d if re.match(r"^\d{4}-\d{2}-\d{2}$", d) else ""
+
+
 def mydrop_fetch(days, max_pages=None, date_start=None, date_end=None):
-    """Заказы MyDrop за период. По умолчанию — последние `days` дней; можно задать явный date_start/date_end."""
+    """Заказы MyDrop за период. По умолчанию — последние `days` дней; можно задать явный date_start/date_end.
+
+    ВАЖНО (проверено 19.11.2026 на живом API): /dropshipper/api/orders ИГНОРИРУЕТ date_type/date_start/
+    date_end — totalCount одинаковый (118 636) с фильтром и без, стр.1 одна и та же. Список идёт от новых
+    к старым (стр.1 = сегодня, стр.40 = 6 дней назад, стр.500 = ~80 дней назад). Раньше из-за этого каждый
+    вызов листал до потолка MD_MAX_PAGES (500 стр. ≈ 10 000 заказов ≈ 80 дней), а pay-detail делал это
+    ещё 3 раза — ~2000 запросов и ~45 мин на прогон «Реклама», ~1540 запросов и ~35 мин на «Телефон».
+    Теперь: фильтр по дате делаем сами и прекращаем листать, как только вся страница старше date_from.
+    Параметры даты в запрос по-прежнему передаём (если MyDrop когда-нибудь начнёт их понимать — не помешают)."""
     if max_pages is None:
         max_pages = MD_MAX_PAGES
     if not MYDROP_KEY:
@@ -1331,24 +1399,34 @@ def mydrop_fetch(days, max_pages=None, date_start=None, date_end=None):
     headers = {"X-API-KEY": MYDROP_KEY, "Accept": "application/json"}
     date_from = date_start or (dt.date.today() - dt.timedelta(days=days)).isoformat()
     date_to = date_end or dt.date.today().isoformat()
-    out, page = [], 1
+    out, page, skipped_new = [], 1, 0
+    stop_reason = "потолок страниц"
     while page <= max_pages:
         params = {"date_type": "period", "date_start": date_from,
                   "date_end": date_to, "page": page}
         r = None
         for attempt in range(1, 6):
+            wait = min(2 ** attempt, 30)
             try:
                 r = requests.get(MYDROP_URL, headers=headers, params=params, timeout=40)
-                break
             except requests.exceptions.RequestException as e:
-                wait = min(2 ** attempt, 30)
                 print(f"MyDrop сеть (стр.{page}, попытка {attempt}/5): {e} — жду {wait}с")
+                r = None
                 time.sleep(wait)
+                continue
+            if r.status_code in (429, 500, 502, 503, 504) and attempt < 5:
+                # раньше 502 Cloudflare сразу обрывал список (18.11 22:27: «Телефон» взял 160 заказов из ~800)
+                print(f"MyDrop HTTP {r.status_code} (стр.{page}, попытка {attempt}/5) — жду {wait}с")
+                time.sleep(wait)
+                continue
+            break
         if r is None:
-            print(f"MyDrop: страница {page} не получена после 5 попыток — стоп.")
+            print(f"MyDrop: страница {page} не получена после 5 попыток — стоп (список неполный).")
+            stop_reason = "сбой сети"
             break
         if r.status_code != 200:
-            print(f"MyDrop HTTP {r.status_code}: {r.text[:200]}")
+            print(f"MyDrop HTTP {r.status_code}: {r.text[:200]} — стоп (список неполный).")
+            stop_reason = f"HTTP {r.status_code}"
             break
         j = r.json()
         if isinstance(j, list):
@@ -1356,16 +1434,31 @@ def mydrop_fetch(days, max_pages=None, date_start=None, date_end=None):
         else:
             batch = j.get("results") or j.get("data") or j.get("orders") or []
             meta = j.get("meta") or {}
-        out += batch
+        days_on_page = [_md_day(m) for m in batch]
+        for m, d in zip(batch, days_on_page):
+            if d and d < date_from:
+                continue
+            if date_end and d and d > date_to:   # верхнюю границу режем только если её задали явно
+                skipped_new += 1                   # (сервер в UTC, MyDrop — киевское время: не терять заказы после 00:00 Киев)
+                continue
+            out.append(m)
         tp = int(meta.get("totalPages") or meta.get("total_pages") or 0) or None
         if not batch:
+            stop_reason = "пустая страница"
             break
         if tp and page >= tp:
+            stop_reason = "последняя страница"
             break
         if not tp and len(batch) < 20:
+            stop_reason = "последняя страница"
+            break
+        known = [d for d in days_on_page if d]
+        if known and max(known) < date_from:
+            stop_reason = f"дошли до {max(known)} < {date_from}"
             break
         page += 1
         time.sleep(0.2)
+    print(f"MyDrop список {date_from}..{date_to}: страниц {page}, заказов {len(out)} ({stop_reason})")
     return out
 
 
@@ -1750,34 +1843,41 @@ def write_catlists():
     print("Майстер-список категорій: " + ", ".join(f"{k.split('-')[-1]}={len(v)}" for k, v in out.items()))
 
 
-def build_pay_detail_index(md_orders, cap=None):
+def build_pay_detail_index(md_orders, cap=None, pay_days=None):
     """Тип оплаты по ДЕТАЛЬНОЙ карточке -> {внешний_номер: (pay, depAmt)}.
     С КЭШЕМ (shop-reports/ads-pay-cache по id): деталь тянем только для НОВЫХ и СВЕЖИХ заказов
     (последние PAY_FRESH_DAYS дней — у них цвет/статус ещё меняется), старые берём из кэша.
-    Заказы месяца собираем кусками по 7 дней (MyDrop за раз отдаёт ограниченно)."""
+    Список заказов окна берётся из md_orders (один проход по MyDrop на прогон)."""
     if not MYDROP_KEY:
         return {}
     from concurrent.futures import ThreadPoolExecutor
     cap = cap if cap is not None else int(os.environ.get("MD_PAY_CAP", "4000"))
-    pay_days = int(os.environ.get("PAY_DAYS", "20"))
+    pay_days = pay_days if pay_days is not None else int(os.environ.get("PAY_DAYS", "20"))
     fresh_days = int(os.environ.get("PAY_FRESH_DAYS", "3"))   # карточку перечитываем 3 дня: статус берём из списка, карточка нужна ради примечания
     headers = {"X-API-KEY": MYDROP_KEY, "Accept": "application/json"}
     today = dt.date.today()
     fresh_cutoff = (today - dt.timedelta(days=fresh_days)).isoformat()
-    # собрать id+дату заказов месяца кусками по 7 дней (это лёгкие list-запросы, без деталей)
+    # id+дата заказов окна PAY_DAYS. Берём из уже полученного списка md_orders, если он покрывает окно
+    # (раньше здесь было 3 отдельных запроса «кусками по 7 дней», но MyDrop фильтр по дате игнорирует —
+    # каждый кусок заново листал 500 страниц).
+    pay_from = (today - dt.timedelta(days=pay_days)).isoformat()
     id_date = {}
-    off, step = 0, 7
-    while off < pay_days:
-        d_end = today - dt.timedelta(days=off)
-        d_start = today - dt.timedelta(days=min(off + step - 1, pay_days))
+    md_days = [_md_day(m) for m in (md_orders or []) if isinstance(m, dict)]
+    md_days = [d for d in md_days if d]
+    if md_days and min(md_days) <= pay_from:
+        src_list = md_orders
+        print(f"pay-detail: окно {pay_days} дн. из уже полученного списка MyDrop ({len(md_orders)} заказов)")
+    else:
         try:
-            chunk = mydrop_fetch(0, date_start=d_start.isoformat(), date_end=d_end.isoformat())
+            src_list = mydrop_fetch(pay_days)
         except Exception as e:
-            print(f"pay-detail chunk {d_start}..{d_end}: {e}"); chunk = []
-        for m in chunk:
-            if isinstance(m, dict) and m.get("id"):
-                id_date[str(m.get("id"))] = str(m.get("dateTime") or m.get("date") or "")[:10]
-        off += step
+            print(f"pay-detail list: {e}"); src_list = []
+    for m in src_list:
+        if isinstance(m, dict) and m.get("id"):
+            d = _md_day(m)
+            if d and d < pay_from:
+                continue
+            id_date[str(m.get("id"))] = d
     # кэш классификаций {id: {ext, pay, dep}}
     cache = {}
     try:
@@ -2107,7 +2207,7 @@ def sd_order_by_ext(ext):
     return None
 
 
-def find_and_add_missing(md_orders):
+def find_and_add_missing(md_orders, days=None):
     """Дописывает в ads-ord заказы, которые ЕСТЬ в MyDrop (магазин по orderSource), но ПОТЕРЯНЫ в приложении.
     Артикул/категорию берём из SalesDrive по внешнему номеру. Ничего существующего не трогаем."""
     if not FIREBASE_DB_URL:
@@ -2116,7 +2216,7 @@ def find_and_add_missing(md_orders):
         cache = requests.get(f"{FIREBASE_DB_URL}/shop-reports/ads-pay-cache2.json", timeout=40).json() or {}
     except Exception:
         cache = {}
-    pay_days = int(os.environ.get("PAY_DAYS", "20"))
+    pay_days = max(int(os.environ.get("PAY_DAYS", "20")), int(days or 0) + 1)   # «уже есть» — не уже окна списка MyDrop
     today = dt.date.today()
     srcs = ["Сайт-Black-street", "Сайт-Bonna-shop", "Хор-Blink", "Хор-Blink-FB", "Сайт-Black-street-FB"]
     # уже имеющиеся внешние номера в ads-ord за окно
@@ -2222,46 +2322,45 @@ def find_and_add_missing(md_orders):
 
 
 def phone_only_run():
-    """Лёгкий частый прогон: ТОЛЬКО MyDrop. Делает две вещи без SalesDrive (не тратит его квоту):
-    1) ручные (web) заказы -> корзина «Телефон»; 2) дотягивает маржу сайтовым заказам из MyDrop.
-    Ставится на каждые ~10 минут."""
-    days = int(os.environ.get("PHONE_DAYS", "3"))
-    wdays = int(os.environ.get("WEBSITE_MARGIN_DAYS", "15"))   # окно обновления маржи/типа оплаты (дней). 35 мог ронять частый прогон — вернул к 15.
-    pages = int(os.environ.get("PHONE_MAX_PAGES", "120"))
-    md = mydrop_fetch(max(days, wdays), pages)   # выборка покрывает и дни телефонных, и дни маржи
+    """Частый прогон: ТОЛЬКО MyDrop (не тратит квоту SalesDrive): ручные (web) заказы -> корзина «Телефон»,
+    маржа/тип оплаты сайтовым заказам, потерянные заказы, возвраты.
+    Окно: частый прогон — MD_FAST_DAYS (7), ночной полный — MD_FULL_DAYS (35). Один проход по MyDrop."""
+    mode = run_mode("phone")
+    window = FULL_DAYS if mode == "full" else FAST_DAYS
+    print(f"run-mode: phone {mode}, окно {window} дн.")
+    md = mydrop_fetch(window, MD_MAX_PAGES)   # mydrop_fetch сам останавливается на дате окна
     print(f"phone-only: MyDrop заказов {len(md)}")
     try:
         _collector_heartbeat("phone-only")
     except Exception as e:
         print(f"diag(phone): {e}")
-    # тип оплаты по ДЕТАЛИ (задаток по примечанию/приватному, полная — цвет/предоплата) для свежих заказов
     pay_idx = {}
     try:
-        pay_idx = build_pay_detail_index(md)
+        pay_idx = build_pay_detail_index(md, pay_days=window)
     except Exception as e:
         print(f"pay-detail: {e}")
-    load_skucamp()   # чтобы категория/название тянулись как обычно (не обязательно, но пусть будет)
+    load_skucamp()
     tree = build_phone_bucket(md)
     n = sum(len(d) for s in tree.values() for d in s.values())
     print(f"phone-only: телефонных заказов {n}")
     if os.environ.get("PHONE_DETAIL_DEBUG", "").strip() in ("1", "true", "yes"):
         _phone_detail_debug(md)
     push_ord_firebase(tree)
-    # дотянуть маржу сайтовым заказам из MyDrop (по номеру заказа) — без SalesDrive.
-    # Оборачиваем: если MyDrop/Firebase подвисли на этом тяжёлом шаге — не роняем весь прогон,
-    # телефонные заказы уже записаны, маржа дотянется на следующем запуске.
+    # маржа сайтовым заказам из MyDrop (по номеру) — без SalesDrive; ошибка шага не роняет прогон
     try:
-        update_website_margins(md, wdays, pay_idx)
+        update_website_margins(md, window, pay_idx)
     except Exception as e:
         print(f"update-margins: пропущено из-за ошибки: {e}")
     try:
-        find_and_add_missing(md)   # дописать потерянные заказы (MyDrop нашёл, артикул из SalesDrive по ext)
+        find_and_add_missing(md, window)
     except Exception as e:
         print(f"add-missing: пропущено из-за ошибки: {e}")
     try:
-        fetch_returns()   # возвраты из Google-таблицы -> Firebase (для «Звіти по магазинах»)
+        fetch_returns()
     except Exception as e:
         print(f"returns: пропущено из-за ошибки: {e}")
+    if mode == "full":
+        mark_full_done("phone")
 
 
 def _phone_detail_debug(md_orders):
@@ -2302,7 +2401,7 @@ def _phone_detail_debug(md_orders):
 
 # ВЕРСИЯ СБОРЩИКА. Пишется в Firebase shop-reports/versions/ads при каждом запуске — портал «Звіти»
 # сравнивает с требуемой и показывает красную плашку, если на сервере стоит старая копия.
-COLLECTOR_VERSION = "2026-11-17.1"
+COLLECTOR_VERSION = "2026-11-19.2"
 
 
 
@@ -2377,7 +2476,14 @@ def main():
         return
     if not SD_URL or not SD_KEYS:
         raise SystemExit("Нет SALESDRIVE_URL или SALESDRIVE_API_KEY — положи в Secrets/Variables.")
-    date_from = (dt.date.today() - dt.timedelta(days=DAYS)).isoformat()
+    global MAX_PAGES
+    mode = run_mode("ads")
+    # SalesDrive: частый — не больше 7 дней; полный (ночью) — 35 дней (и не меньше настройки ads_days)
+    sd_days = max(DAYS, FULL_DAYS) if mode == "full" else min(DAYS, FAST_DAYS)
+    if mode == "full":
+        MAX_PAGES = max(MAX_PAGES, 100)   # 35 дн. ≈ 5 000 заказов SalesDrive
+    print(f"run-mode: ads {mode}, окно {sd_days} дн.")
+    date_from = (dt.date.today() - dt.timedelta(days=sd_days)).isoformat()
     print(f"SalesDrive: заказы с {date_from}, по {LIMIT}/страницу.")
 
     if PROBE:
@@ -2405,8 +2511,13 @@ def main():
     pay_idx = {}
     md = []
     if MYDROP_KEY:
-        md = mydrop_fetch(DAYS)
-        print(f"MyDrop: заказов {len(md)}")
+        # один проход по MyDrop на прогон (окно режима, см. run_mode) — его же берут
+        # маржа, «Телефон» и pay-detail (раньше 4 прохода по 500 страниц, см. mydrop_fetch).
+        # MyDrop: окно SalesDrive + 1 день запаса — заказ SalesDrive без пары в MyDrop (mbe) старше 1 дня
+        # build_ord УДАЛЯЕТ из базы, поэтому список MyDrop обязан покрыть всё окно SalesDrive.
+        md_window = sd_days + 1
+        md = mydrop_fetch(md_window)
+        print(f"MyDrop: заказов {len(md)} (окно {md_window} дн.)")
         try:
             _collector_heartbeat("ads-full")  # пульс: идёт полный прогон
             _status_histogram(md)             # лёгкая диагностика статусов (список) — пусть будет
@@ -2416,7 +2527,7 @@ def main():
         mbe = build_margin_index(md)
         mbe_ph = build_margin_phone_index(md)
         try:
-            pay_idx = build_pay_detail_index(md)   # тип оплаты по детали (задаток/оплата по цвету) за весь месяц
+            pay_idx = build_pay_detail_index(md, pay_days=md_window)   # тип оплаты по детали (задаток/оплата по цвету) за весь месяц
         except Exception as e:
             print(f"pay-detail(ads): {e}"); pay_idx = {}
         site = [extract(x) for x in orders]
@@ -2491,6 +2602,9 @@ def main():
     except Exception as e:
         print(f"ads-ord: {e}")
         push_ads_firebase(agg)   # запасной путь, если поордерная сборка упала
+        return                   # полный прогон не засчитываем — повторится этой же ночью
+    if mode == "full":
+        mark_full_done("ads")
 
 
 if __name__ == "__main__":
